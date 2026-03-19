@@ -1,0 +1,7 @@
+dotenv==0.9.9
+python-123-client==0.0.5.2
+requests==2.32.3
+watchdog==6.0.0
+
+flask
+p115client==0.0.5.12.3

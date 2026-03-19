@@ -1,0 +1,29 @@
+# 环境变量
+.env
+.env.docker
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# 数据库
+*.db
+*.db-shm
+*.db-wal
+
+# 日志
+*.log
+
+# Docker
+data/
+logs/

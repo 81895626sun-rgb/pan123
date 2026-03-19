@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  pan123-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pan123-monitor
+    hostname: pan123-monitor
+    volumes:
+      - ./env:/app/.env:ro
+      - ./data/cid_mapping.db:/app/cid_mapping.db
+      - ./data/upload_state.db:/app/upload_state.db
+      - ./data/upload.log:/app/upload.log
+      - ./data/error.log:/app/error.log
+      - ${MONITOR_DIR}:${MONITOR_DIR}:ro
+    restart: unless-stopped
