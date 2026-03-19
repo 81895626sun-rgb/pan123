@@ -8,7 +8,7 @@ from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff
 from pan123 import convert_to_cloud_path #导入pan123中的方法
 from pan123 import find_directory_path
 from pan123 import find_cid_by_parts
-from queue import Queue, Full
+from queue import Queue, Full, Empty
 from client import CloudClientManager
 import logging
 import os
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from utils.onestrm_notifier import OneStrmNotifier
 # from upload_worker import upload_task_worker
 import threading
+from file_checker import FileGrowthChecker, FileState
 
 # 配置日志（只需在这里写一次）
 log_file = os.path.join(os.getcwd(), 'upload.log')
@@ -54,81 +55,100 @@ class UploadTask:
         self.pan_name = pan_name  # 标识任务所属网盘（"123" 或 "115"）
 
 class SimpleFileMonitor:
-    """简化版文件监控器"""
-    def __init__(self, path,client_115,client_123):
+    """事件驱动版文件监控器（防抖队列管理）"""
+    def __init__(self, path, client_115, client_123):
         self.path = path
         self.client_115 = client_115
         self.client_123 = client_123
-        self.last_files = set()
-        self.scan_interval = 300  # 5秒扫描间隔
-        self.last_scan = 0
-        self.snapshot = DirectorySnapshot(self.path)
-        self.upload_queue = Queue(maxsize=1000) # 上传队列
-        
-    def take_snapshot(self):
-        """使用DirectorySnapshot获取文件和文件夹快照"""
-        new_snapshot = DirectorySnapshot(self.path)
-        diff = DirectorySnapshotDiff(self.snapshot, new_snapshot)
-        self.snapshot = new_snapshot
-
-        # 打印所有变化（调试用）
-        logging.info(f"[DEBUG] 新增文件: {diff.files_created}")
-        logging.info(f"[DEBUG] 新增文件夹: {diff.dirs_created}")
-        
-        # 收集新增项
-        new_items = set()
-        new_items.update(diff.files_created)
-        new_items.update(diff.dirs_created)
-        
-        # 过滤临时文件和隐藏文件
-        return {item for item in new_items
-                if not (os.path.basename(item).startswith(('.', '~')) or
-                os.path.basename(item).lower().endswith((
-                    '.tmp', '.temp', '.swp', '.bak', '.orig', '.backup', '-upload-tmp'
-                )))}
-        # return {item for item in new_items 
-        #        if not os.path.basename(item).startswith(('~', '.'))}
-    
-    def check_changes(self):
-        """检查文件变化并返回路径最短的新文件/文件夹"""
-        now = time.time()
-        if now - self.last_scan < self.scan_interval:
-            return []
-            
-        current_files = self.take_snapshot()
-        new_files = current_files - self.last_files
-        self.last_files = current_files
-        self.last_scan = now
-        
-        if not new_files:
-            return []
-            
-        # 找到所有路径最短的文件/文件夹（基于路径深度）
-        new_files_list = list(new_files)
-        rel_paths = [os.path.relpath(x, self.path) for x in new_files_list]
-        # 计算每个路径的深度（组成部分数量）
-        # path_depths = [len(p.split(os.sep)) for p in rel_paths]
-        path_depths = [len(p.replace('\\', '/').strip('/').split('/')) for p in rel_paths]
-        min_depth = min(path_depths)
-        shortest_indices = [i for i, depth in enumerate(path_depths) if depth == min_depth]
-        result = [new_files_list[i] for i in shortest_indices]
-        return result
+        self.upload_queue = Queue(maxsize=1000) # 正式上传队列传递给 worker
+        self.pending_queue = Queue(maxsize=1000) # 待确认防抖队列，收集即时事件
+        self.pending_tasks = set() # 辅助集合，防止同一路径反复加入防抖队列
 
 class SimpleFileHandler(FileSystemEventHandler):
-    """简化版文件处理器"""
+    """事件驱动版文件处理器"""
     def __init__(self, monitor):
         super().__init__()
         self.monitor = monitor
         
-    def on_created(self, _):
-        pass
-    def on_modified(self, _):
-        pass
-    def on_moved(self, _):
-        pass
-    def on_deleted(self, _):
-        pass
+    def is_temp_file(self, filepath):
+        name = os.path.basename(filepath)
+        if name.startswith(('.', '~')): 
+            return True
+        if name.lower().endswith(('.tmp', '.temp', '.swp', '.bak', '.orig', '.backup', '-upload-tmp')): 
+            return True
+        return False
 
+    def handle_event(self, path):
+        if self.is_temp_file(path):
+            return
+        
+        # 只在不在待处理集合中时加入队列，防止重复事件轰炸
+        if path not in self.monitor.pending_tasks:
+            self.monitor.pending_tasks.add(path)
+            try:
+                self.monitor.pending_queue.put_nowait(path)
+                logging.info(f"系统事件捕获 [加入防抖队列]: {path}")
+            except Full:
+                logging.warning(f"防抖队列已满，丢弃事件: {path}")
+
+    def on_created(self, event):
+        self.handle_event(event.src_path)
+
+    def on_moved(self, event):
+        # 针对在监听文件夹内外挪动的情况
+        self.handle_event(event.dest_path)
+
+def debounce_worker_thread(client_123, client_115, monitor):
+    """守护线程：循环检查 pending_queue 里的文件是否已经结束跳动（防等待抢跑）"""
+    logging.info("防抖工作线程 (Debounce Worker) 已启动，等待底层系统事件推送...")
+    while True:
+        try:
+            # 阻塞获取新变化的文件，超时进行循环空转
+            filepath = monitor.pending_queue.get(timeout=1.0)
+            
+            # 使用 FileGrowthChecker 采样
+            state, size = FileGrowthChecker.check_growth(filepath)
+            
+            if state == FileState.NOT_FOUND:
+                logging.warning(f"文件在其生长防抖期间被移除或重命名: {filepath}")
+                monitor.pending_tasks.discard(filepath)
+                monitor.pending_queue.task_done()
+                
+            elif state == FileState.GROWING:
+                # 仍在增长中，将其送回队列尾部继续等待并放缓重试
+                monitor.pending_queue.put(filepath)
+                monitor.pending_queue.task_done()
+                time.sleep(0.5)
+                
+            elif state == FileState.READY:
+                # 状态稳定，可以安全地发到路由层处理
+                logging.info(f"文件复制/生成完毕 (防抖就绪): {filepath} - 最终大小: {size} byte")
+                monitor.pending_tasks.discard(filepath)
+                monitor.pending_queue.task_done()
+                
+                # 执行原先的分发路由
+                OneStrmNotifier.notify_file_creation()
+                
+                try:
+                    if os.path.exists(filepath): # 再次确保瞬间没被干掉
+                        if os.path.isdir(filepath):
+                            handle_dir_creation(client_123=client_123, client_115=client_115, monitor=monitor, file=filepath)
+                        else:
+                            handle_file_creation_123(client_123, monitor, filepath)
+                            handle_file_creation_115(client_115, monitor, filepath)
+                except Exception as e:
+                    logging.error(f"分派路径时出错 {filepath}: {str(e)}")
+                    
+            elif state == FileState.ERROR:
+                logging.error(f"探测遇到不可恢复系统错误: {filepath}")
+                monitor.pending_tasks.discard(filepath)
+                monitor.pending_queue.task_done()
+                
+        except Empty:
+            continue
+        except Exception as e:
+            logging.error(f"防抖工作线程捕获全局异常: {str(e)}")
+            time.sleep(1)
 
 
 #处理新增文件
@@ -308,7 +328,7 @@ def process_folder_recursive(client, local_path, parent_id, monitor=None):
 
 #启动目录监控
 def start_monitoring(path,client_115,client_123):
-    """启动目录监控"""
+    """启动事件驱动版目录监控"""
     monitor = SimpleFileMonitor(path,client_115,client_123)  
     event_handler = SimpleFileHandler(monitor)
     observer = Observer()
@@ -316,50 +336,22 @@ def start_monitoring(path,client_115,client_123):
     observer.start()
 
 
-    # 启动上传工作线程
+    # 启动上传工作线程 (Upload Worker)
     from upload_worker import upload_task_worker
     upload_thread = threading.Thread(target=upload_task_worker, args=(monitor.upload_queue,))
     upload_thread.daemon = True
     upload_thread.start()
     
+    # 启动防抖守护线程 (Debounce Worker)
+    debounce_thread = threading.Thread(target=debounce_worker_thread, args=(client_123, client_115, monitor))
+    debounce_thread.daemon = True
+    debounce_thread.start()
+    
     try:
-        logging.info(f"开始监控目录: {path} (平台: {platform.system()})")
-        logging.info(f"扫描间隔: {monitor.scan_interval}秒")
-        last_check = time.monotonic()
-        check_interval = monitor.scan_interval
+        logging.info(f"开始事件驱动监控目录: {path} (平台: {platform.system()})")
+        # 主线程挂起，由 watchdog 自动捕获底层的变动推送
         while True:
-            now = time.time()
-            next_check = last_check + check_interval
-            if now >= next_check:
-                new_items = monitor.check_changes()
-            
-                for item_path in new_items:
-                    OneStrmNotifier.notify_file_creation()
-                    try:
-                    # 检查路径是否存在（避免竞态条件）
-                        if not os.path.exists(item_path):
-                            logging.error(f"警告: 路径已不存在: {item_path}")
-                            continue
-                    
-                        # 判断是文件还是目录
-                        if os.path.isdir(item_path):
-                            # 处理目录
-                            handle_dir_creation(client_123=client_123, client_115=client_115, monitor=monitor, file=item_path)
-                        else:
-                        # 处理文件
-                            handle_file_creation_123(client_123, monitor, item_path)
-                            handle_file_creation_115(client_115, monitor, item_path)
-
-                    
-                    except Exception as e:
-                        logging.error(f"处理路径时出错 {item_path}: {str(e)}")
-                last_check = now
-            else:
-                sleep_time = min(next_check - time.time(),6.0)
-                if sleep_time > 0.1:
-                    time.sleep(sleep_time)
-
-            # time.sleep(0.1)
+            time.sleep(1.0)
             
     except KeyboardInterrupt:
         observer.stop()
