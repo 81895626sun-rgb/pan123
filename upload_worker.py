@@ -56,19 +56,13 @@ def handle_upload_failure(upload_queue, task, error_msg=None):
     """处理上传失败的情况，包括重试或放弃"""
     if task.retries < MAX_RETRIES:
         task.retries += 1
-        upload_queue.put(task)  # 重试任务
-        retry_msg = f"上传任务 {task.local_path} 失败"
-        if error_msg:
-            retry_msg += f"，错误: {error_msg}"
-        logging.info(f"{retry_msg}，重试次数: {task.retries}")
+        upload_queue.put(task)
+        logging.info(f"♻️ 【任务排队重试】({task.retries}/{MAX_RETRIES}) | 网盘:[{task.pan_name}] | 文件:[{task.local_path}]")
     else:
-        failure_msg = f"上传任务 {task.local_path} 失败，达到最大重试次数，放弃"
-        if error_msg:
-            failure_msg += f"。最后错误: {error_msg}"
-        logging.error(failure_msg)
-        log_failed_task(task, error_msg)  # 记录失败任务
+        error_brief = str(error_msg)[:150].replace('\n', ' ') if error_msg else "未知错误"
+        logging.error(f"❌ 【彻底放弃上传】网盘:[{task.pan_name}] | 失败文件:[{task.local_path}] | 最终错误:[{error_brief}]")
+        log_failed_task(task, error_msg)
         upload_queue.task_done()
-        # logging.info(f"此时队列中的任务数量是 ：{upload_queue.unfinished_tasks}")
 
 
 def upload_task_worker(upload_queue):
@@ -106,12 +100,12 @@ def upload_task_worker(upload_queue):
                             upload_queue.task_done()  # 仅在此处标记任务完成
                             # logging.info(f"此时队列中的任务数量是 ：{upload_queue.unfinished_tasks}")
                         else:
-                            logging.warning(f"上传返回无效结果: {upload_result}")
-                            handle_upload_failure(upload_queue, task, "无效的API响应")
+                            handle_upload_failure(upload_queue, task, f"无效的API响应: {str(upload_result)[:100]}")
 
                     except Exception as e:
-                        logging.error(f"上传过程异常: {task.local_path} -> {str(e)}")
-                        handle_upload_failure(upload_queue, task, str(e))
+                        error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
+                        logging.warning(f"【上传遇阻】网盘:[123] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
+                        handle_upload_failure(upload_queue, task, error_msg)
                 elif task.pan_name == "115":
                     try:
                         upload_file(
@@ -121,8 +115,9 @@ def upload_task_worker(upload_queue):
                         )
                         log_successful_task(task,task.dir_id)
                     except Exception as e:
-                        logging.error(f"上传过程异常: {task.local_path} -> {str(e)}")
-                        handle_upload_failure(upload_queue, task, str(e))
+                        error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
+                        logging.warning(f"【上传遇阻】网盘:[115] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
+                        handle_upload_failure(upload_queue, task, error_msg)
             elif state == FileState.GROWING:
                 # 3.2 文件被锁定或正在写入
                 if task.retries < MAX_RETRIES:

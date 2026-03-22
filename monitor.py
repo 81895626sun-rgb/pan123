@@ -143,6 +143,7 @@ def debounce_worker_thread(client_123, client_115, monitor):
 
             elif state == FileState.GROWING:
                 # 文件仍在写入，送回队列尾部继续等待
+                logging.info(f"⏳ 文件体积仍在增长，回炉继续等待拷贝: {filepath}")
                 monitor.pending_queue.put(filepath)
                 monitor.pending_queue.task_done()
                 time.sleep(0.5)

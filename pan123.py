@@ -269,8 +269,7 @@ def upload_chunk(args: Tuple[int, bytes, str, int]) -> Tuple[int, Optional[str]]
         logging.info(f"[成功] 分块 {part_num} (大小: {chunk_size/1024/1024:.1f}MB) etag的值为{etag}")
         return part_num, etag
     except Exception as e:
-        # print(f"[失败] 分块 {part_num}: {str(e)}")
-        logging.error(f"[失败] 分块 {part_num}: {str(e)}", exc_info=True)
+        logging.warning(f"[分块失败] 序号 {part_num} 遇到网络波动或异常，稍后重试。详情: {str(e)[:100]}")
         return part_num, None
 
 def process_upload_batch(
@@ -326,8 +325,7 @@ def process_upload_batch(
                     futures = []
                     
             except Exception as e:
-                # print(f"[错误] 分块 {part_num} 准备失败: {str(e)}")
-                logging.error(f"[失败] 分块 {part_num}: {str(e)}", exc_info=True)
+                logging.warning(f"[分块准备失败] 序号 {part_num} 连接失败，稍后重试。详情: {str(e)[:100]}")
                 failed_parts.add(part_num)
         
         # 处理剩余任务
@@ -432,7 +430,8 @@ def upload_large_video(
         })
         
     except Exception as e:
-        logging.error(f"upload_large_video方法上传过程中发生错误: {e}")
+        # 这个错最后会被外层捕获，这里记录个简短的即可，不要抛庞大的堆栈
+        logging.warning(f"123大文件上传中继受阻，剩余分块将交由外层重试。")
         raise
 
 
@@ -548,10 +547,8 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
         return chunked_result
 
     except Exception as e:
-        msg = f"上传过程中发生错误: {str(e)}"
-        # print(msg)
-        logging.error(msg, exc_info=True)
-        return None
+        # 交给最高层 upload_worker 打印精简格式
+        raise e
     finally:
         if hasattr(file_source, 'close'):
             file_source.close()
