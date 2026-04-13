@@ -160,6 +160,7 @@ def debounce_worker_thread(client_123, client_115, monitor):
 
                 if os.path.exists(filepath):
                     OneStrmNotifier.notify_file_creation()
+                    OneStrmNotifier.trigger_qmediasync()
                     _enqueue_priority(monitor, filepath)
 
             elif state == FileState.ERROR:
