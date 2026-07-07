@@ -3,6 +3,7 @@ from pathlib import Path
 from p123client import P123Client
 from p123client.client import DEFAULT_BASE_URL
 from p115client import P115Client
+import p115oss.upload
 from p115client import check_response
 import atexit
 import logging
@@ -42,6 +43,22 @@ class P123ClientFixed(P123Client):
             async_=async_,
             **request_kwargs,
         )
+
+
+# p115oss 0.1.0.3 的 upload_init 有 bug: `appversion = payload["appversion"]` 会 KeyError
+# (upload_file 构造的 payload 里没 appversion), 115 上传必崩 (被包装成 MultipartUploadAbort)。
+# 修正: 调用前注入真实 appversion "36.2.28"。
+# 注意: 不能用 p115oss 0.1.0.2 —— 它用假 appversion "99.99.99.99", 会被 115 WAF 拦 405。
+_orig_p115oss_upload_init = p115oss.upload.upload_init
+
+
+def _p115oss_upload_init_fixed(payload, *, async_=False, **request_kwargs):
+    if "appversion" not in payload:
+        payload = {**payload, "appversion": "36.2.28"}
+    return _orig_p115oss_upload_init(payload, async_=async_, **request_kwargs)
+
+
+p115oss.upload.upload_init = _p115oss_upload_init_fixed
 
 
 class CloudClientManager:
