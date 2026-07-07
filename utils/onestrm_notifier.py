@@ -11,7 +11,10 @@ from .telegram_notifier import send_telegram_message  # 使用相对导入
 QMEDIASYNC_BASE_URL = os.getenv("QMEDIASYNC_BASE_URL", "")
 QMEDIASYNC_API_KEY = os.getenv("QMEDIASYNC_API_KEY", "")
 # sync_path id: 1=movie, 2=teleplay
-QMEDIASYNC_PATH_IDS = [1, 2]
+try:
+    QMEDIASYNC_PATH_IDS = [int(x) for x in os.getenv("QMEDIASYNC_PATH_IDS", "1,2").split(",") if x.strip()]
+except ValueError:
+    QMEDIASYNC_PATH_IDS = [1, 2]
 # 防抖延迟：最后一个文件就绪后等待多少秒再触发同步
 QMEDIASYNC_DEBOUNCE_SECONDS = 120
 
