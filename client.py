@@ -1,11 +1,47 @@
 import os
 from pathlib import Path
 from p123client import P123Client
+from p123client.client import DEFAULT_BASE_URL
 from p115client import P115Client
 from p115client import check_response
 import atexit
 import logging
 from typing import Dict, Optional, Union
+
+
+# 123pan 已将 API 由 www.123pan.com/b 迁移至裸域名 123pan.com。
+# p123client 写死的 DEFAULT_BASE_URL ("https://www.123pan.com/b") 已失效：
+#   www.123pan.com 现为纯前端站点，/api/* 返回 SPA HTML 壳（200），/b/api/* 部分接口 404。
+# 这会让 user_info 拿到 HTML 触发 orjson 解析失败、fs_list_new 404，导致上传全部失败。
+# 在此覆盖 request，把等于库默认值的失效 base_url 重定向到可用 host；
+# 登录走的 login.123pan.com（DEFAULT_LOGIN_BASE_URL）不受影响。
+_WORKING_123_BASE_URL = "https://123pan.com"
+
+
+class P123ClientFixed(P123Client):
+    """修正 p123client 失效 base_url 的 123 云盘客户端。"""
+
+    def request(
+        self,
+        url,
+        method="GET",
+        request=None,
+        base_url=DEFAULT_BASE_URL,
+        headers=None,
+        async_=False,
+        **request_kwargs,
+    ):
+        if isinstance(base_url, str) and base_url == DEFAULT_BASE_URL:
+            base_url = _WORKING_123_BASE_URL
+        return super().request(
+            url,
+            method=method,
+            request=request,
+            base_url=base_url,
+            headers=headers,
+            async_=async_,
+            **request_kwargs,
+        )
 
 
 class CloudClientManager:
@@ -92,8 +128,8 @@ class CloudClientManager:
         if not passport or not password:
             raise ValueError("未设置环境变量 P123_PASSPORT 或 P123_PASSWORD")
 
-        # 正确的初始化方式
-        client = P123Client(passport, password)
+        # 正确的初始化方式（P123ClientFixed 修正了失效的 base_url）
+        client = P123ClientFixed(passport, password)
         return client
 
     def _new_115_client(self) -> P115Client:
@@ -110,7 +146,7 @@ class CloudClientManager:
         if not cookie:
             raise ValueError("未设置115云盘cookie（环境变量P115_COOKIE或cookie文件）")
 
-        client = P115Client(cookies=cookie,ensure_cookies=True)
+        client = P115Client(cookies=cookie)
         # 使用login_status()检查登录状态
         if not client.login_status():
             logging.error("115云盘登录状态验证失败")

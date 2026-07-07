@@ -159,7 +159,6 @@ def debounce_worker_thread(client_123, client_115, monitor):
                 monitor.dispatched_tasks.add(filepath)
 
                 if os.path.exists(filepath):
-                    OneStrmNotifier.notify_file_creation()
                     OneStrmNotifier.trigger_qmediasync()
                     _enqueue_priority(monitor, filepath)
 
@@ -415,7 +414,7 @@ def start_monitoring(path, client_115, client_123):
 
     # 启动上传工作线程 (Upload Worker)
     from upload_worker import upload_task_worker
-    upload_thread = threading.Thread(target=upload_task_worker, args=(monitor.upload_queue,))
+    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue,))
     upload_thread.daemon = True
     upload_thread.start()
 

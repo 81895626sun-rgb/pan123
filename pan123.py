@@ -621,15 +621,14 @@ def _upload_small_file(client, file_path: str, file_name: str, pid: int | str) -
 # ---------- 115大文件上传子逻辑 ----------
 def _upload_large_file(client, file_path: str, pid: int | str):
     """128 MiB+ 文件上传，秒传/分块自动切换，无 file_id 需求"""
-    def progress_cb(info):
-        done, total = info["uploaded"], info["total"]
-        logging.info(f"\r↑ {done/total*100:6.2f}%  {done>>20}/{total>>20} MiB")
-
+    # p115client 0.0.9.3.x 移除了 upload_file 的 progress 参数（进度回调改用 reporthook，
+    # 签名 Callable[[int], Any]，与旧的 progress_cb(info dict) 不兼容）。
+    # 此处不再传进度回调；如需恢复进度日志，可改用 reporthook=<callable>。
     resp = client.upload_file(
         file_path,
         pid=pid,
         partsize=128 * 1024 * 1024,
-        **{"progress": progress_cb, "async_": False}
+        async_=False,
     )
 
     if not resp.get("state"):

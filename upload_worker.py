@@ -1,5 +1,4 @@
 from queue import  Empty
-from client import  CloudClientManager
 from pan123 import smart_upload, upload_file
 import logging
 import json
@@ -10,9 +9,15 @@ from file_checker import FileGrowthChecker, FileState  # 添加 FileState
 
 MAX_RETRIES = 3  # 最大重试次数
 FAILED_TASKS_FILE = "failed_tasks.txt"  # 失败任务记录文件
-client_123 = CloudClientManager().get_client('123')  # 123云盘客户端
-client_115 = CloudClientManager().get_client('115')  # 115云盘客户端
-telegram_notifier = TelegramNotifier()  # 初始化Telegram通知器
+_telegram_notifier = None
+
+
+def _get_telegram_notifier():
+    """懒加载 Telegram 通知器，避免 import 时副作用（缺凭证会 raise）。"""
+    global _telegram_notifier
+    if _telegram_notifier is None:
+        _telegram_notifier = TelegramNotifier()
+    return _telegram_notifier
 
 def log_failed_task(task, error_msg):
     """将失败任务记录到文件"""
@@ -37,7 +42,7 @@ def log_failed_task(task, error_msg):
         f"重试次数: {task.retries}/{MAX_RETRIES}\n"
         f"错误: {error_msg}"
     )
-    telegram_notifier.send_message(notification)
+    _get_telegram_notifier().send_message(notification)
     
 def log_successful_task(task, file_id):
     """将成功任务记录到文件并发送通知"""
@@ -50,7 +55,7 @@ def log_successful_task(task, file_id):
         f"✅ 上传任务成功\n"
         f"盘为: {task.pan_name}\n"
     )
-    telegram_notifier.send_message(notification)
+    _get_telegram_notifier().send_message(notification)
 
 def handle_upload_failure(upload_queue, task, error_msg=None):
     """处理上传失败的情况，包括重试或放弃"""
@@ -65,7 +70,7 @@ def handle_upload_failure(upload_queue, task, error_msg=None):
         upload_queue.task_done()
 
 
-def upload_task_worker(upload_queue):
+def upload_task_worker(client_123, client_115, upload_queue):
     """文件上传工作线程（完整修正版）"""
     last_active_time = time.time()
     while True:
@@ -105,6 +110,9 @@ def upload_task_worker(upload_queue):
                     except Exception as e:
                         error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
                         logging.warning(f"【上传遇阻】网盘:[123] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
+                        _cause = e.__cause__ or e.__context__
+                        if _cause:
+                            logging.error(f"【上传异常根因】网盘:[123] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
                         handle_upload_failure(upload_queue, task, error_msg)
                 elif task.pan_name == "115":
                     try:
@@ -117,6 +125,9 @@ def upload_task_worker(upload_queue):
                     except Exception as e:
                         error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
                         logging.warning(f"【上传遇阻】网盘:[115] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
+                        _cause = e.__cause__ or e.__context__
+                        if _cause:
+                            logging.error(f"【上传异常根因】网盘:[115] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
                         handle_upload_failure(upload_queue, task, error_msg)
             elif state == FileState.GROWING:
                 # 3.2 文件被锁定或正在写入
