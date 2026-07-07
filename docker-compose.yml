@@ -2,9 +2,8 @@ version: '3.8'
 
 services:
   pan123-monitor:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # 镜像由 GitHub Action 构建并导出为 tarball, 部署时先 docker load -i pan123-monitor.tar.gz
+    image: pan123-monitor:latest
     container_name: pan123-monitor
     hostname: pan123-monitor
     volumes:
