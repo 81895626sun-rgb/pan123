@@ -1,0 +1,60 @@
+name: Build and Export Docker Image
+
+# 触发条件:
+#   - push 到 main: 构建镜像, 上传 tarball 为 artifact (Actions 运行页可下载, 30 天)
+#   - 推 v* 标签: 额外创建 Release 并附上 tarball (永久下载)
+#   - workflow_dispatch: 手动触发
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        # CI 用官方 python:3.12-slim + 官方源 (国际 runner 快); 国内华为云源留作本地构建默认值
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=python:3.12-slim \
+            --build-arg CN_MIRROR=0 \
+            -t pan123-monitor:latest \
+            .
+
+      - name: Save image to tarball
+        run: |
+          docker save pan123-monitor:latest -o pan123-monitor.tar
+          gzip -9 -f pan123-monitor.tar
+          ls -lh pan123-monitor.tar.gz
+          {
+            echo "## 镜像压缩包"
+            echo ""
+            echo "- 文件: \`pan123-monitor.tar.gz\`"
+            echo "- 大小: $(du -h pan123-monitor.tar.gz | cut -f1)"
+            echo "- commit: ${{ github.sha }}"
+            echo ""
+            echo "下载后导入:"
+            echo '```bash'
+            echo "docker load -i pan123-monitor.tar.gz"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload tarball as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pan123-monitor-image-${{ github.sha }}
+          path: pan123-monitor.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create release with tarball (on tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pan123-monitor.tar.gz
+          generate_release_notes: true
