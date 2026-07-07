@@ -1,5 +1,14 @@
+import os
+from dotenv import load_dotenv
 from p123client import P123Client
-client = P123Client(passport="REDACTED", password="REDACTED")
+
+load_dotenv()
+passport = os.getenv("P123_PASSPORT")
+password = os.getenv("P123_PASSWORD")
+if not passport or not password:
+    raise SystemExit("未在 .env 配置 P123_PASSPORT / P123_PASSWORD")
+
+client = P123Client(passport, password)
 payload = {
                 "parentFileId": 7948523,  # 关键点
                 "driveId": "0",             # 必需参数

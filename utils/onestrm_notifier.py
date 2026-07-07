@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import json
 import threading
 import requests
 from typing import Dict, Any
 from .telegram_notifier import send_telegram_message  # 使用相对导入
 
-QMEDIASYNC_BASE_URL = "http://REDACTED:20683"
-QMEDIASYNC_API_KEY = "REDACTED"
+QMEDIASYNC_BASE_URL = os.getenv("QMEDIASYNC_BASE_URL", "")
+QMEDIASYNC_API_KEY = os.getenv("QMEDIASYNC_API_KEY", "")
 # sync_path id: 1=movie, 2=teleplay
 QMEDIASYNC_PATH_IDS = [1, 2]
 # 防抖延迟：最后一个文件就绪后等待多少秒再触发同步
