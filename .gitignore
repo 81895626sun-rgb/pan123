@@ -1,6 +1,7 @@
 # 环境变量
 .env
 .env.docker
+115_cookie.txt
 
 # Python
 __pycache__/
@@ -12,9 +13,10 @@ __pycache__/
 dist/
 build/
 
-# IDE
+# IDE / 本地工具
 .vscode/
 .idea/
+.claude/
 
 # 数据库
 *.db
@@ -27,3 +29,7 @@ build/
 # Docker
 data/
 logs/
+
+# 运行时状态 / 个人草稿（不进仓库）
+failed_tasks.txt
+newplan.txt

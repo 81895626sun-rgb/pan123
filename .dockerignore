@@ -1,0 +1,31 @@
+# === 凭证 / 运行时状态：绝不能进镜像 ===
+.env
+.env.*
+!.env.example
+115_cookie.txt
+*.db
+*.db-shm
+*.db-wal
+failed_tasks.txt
+data/
+logs/
+*.log
+
+# === Git / CI 元数据（镜像不需要） ===
+.git/
+.github/
+.gitignore
+
+# === Python 缓存 ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# === 测试 / 草稿：运行时不需要 ===
+tests/
+123test.py
+test_client.py
+Process.txt
+data_Process.txt
+newplan.txt

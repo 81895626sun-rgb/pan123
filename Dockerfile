@@ -4,8 +4,6 @@
 ARG BASE_IMAGE=swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/python:3.12-slim
 FROM ${BASE_IMAGE}
 
-LABEL maintainer="1696363859@qq.com"
-
 WORKDIR /app
 
 # CN_MIRROR=1 (默认, 国内): apt 换华为云源; CN_MIRROR=0 (CI): 用官方 debian 源
