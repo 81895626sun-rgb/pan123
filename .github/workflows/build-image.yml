@@ -29,18 +29,17 @@ jobs:
       - name: Save image to tarball
         run: |
           docker save pan123-monitor:latest -o pan123-monitor.tar
-          gzip -9 -f pan123-monitor.tar
-          ls -lh pan123-monitor.tar.gz
+          ls -lh pan123-monitor.tar
           {
             echo "## 镜像压缩包"
             echo ""
-            echo "- 文件: \`pan123-monitor.tar.gz\`"
-            echo "- 大小: $(du -h pan123-monitor.tar.gz | cut -f1)"
+            echo "- 文件: \`pan123-monitor.tar\`"
+            echo "- 大小: $(du -h pan123-monitor.tar | cut -f1)"
             echo "- commit: ${{ github.sha }}"
             echo ""
             echo "下载后导入:"
             echo '```bash'
-            echo "docker load -i pan123-monitor.tar.gz"
+            echo "docker load -i pan123-monitor.tar"
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
@@ -48,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pan123-monitor-image-${{ github.sha }}
-          path: pan123-monitor.tar.gz
+          path: pan123-monitor.tar
           retention-days: 30
           if-no-files-found: error
 
@@ -56,5 +55,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: pan123-monitor.tar.gz
+          files: pan123-monitor.tar
           generate_release_notes: true
