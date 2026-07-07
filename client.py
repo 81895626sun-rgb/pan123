@@ -84,20 +84,13 @@ class CloudClientManager:
 
     @classmethod
     def _cleanup(cls):
-        """程序退出时自动清理所有客户端"""
+        """程序退出时自动清理所有客户端。
+        注意: 不调用 115 的 logout() —— logout 会让 115 服务端终止该 cookie 对应的
+        登录设备, 导致 cookie 失效, 下次启动(或测试)无法登录。仅本地置 None 释放引用。"""
         for service, client in cls._clients.items():
             if client:
-                try:
-                    if service == '123':
-                        # 123云盘没有logout方法，直接设为None
-                        cls._clients[service] = None
-                    else:
-                        client.logout()
-                    logging.info(f"{service}云盘客户端已注销")
-                except Exception as e:
-                    logging.error(f"{service}云盘客户端注销失败: {str(e)}")
-                finally:
-                    cls._clients[service] = None
+                cls._clients[service] = None
+                logging.info(f"{service}云盘客户端已清理(保留会话,不logout)")
 
     def get_client(self, service: str = '123') -> Union[P123Client, P115Client]:
         """
