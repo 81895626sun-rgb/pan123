@@ -166,15 +166,12 @@ class CloudClientManager:
         return client
 
     def reset_client(self, service: str):
-        """强制重置指定云服务的客户端"""
+        """强制重置指定云服务的客户端。
+        注意: 不调用 logout() —— 同 _cleanup, 115 的 logout() 会让服务端终止该 cookie
+        对应的登录设备, 导致 cookie 失效。test_client.py 跑完会调这里,
+        之前就是这步把 115 cookie 杀掉的(原 _cleanup 修复的漏网之鱼)。"""
         if service not in self._clients:
             raise ValueError(f"不支持的云服务类型: {service}")
-
         if self._clients[service]:
-            try:
-                if service == '115':  # 只有115需要logout
-                    self._clients[service].logout()
-            except Exception as e:
-                logging.error(f"{service}云盘客户端注销异常: {str(e)}")
-        self._clients[service] = None
-        logging.info(f"{service}云盘客户端已重置")
+            self._clients[service] = None
+            logging.info(f"{service}云盘客户端已重置(保留会话,不logout)")
