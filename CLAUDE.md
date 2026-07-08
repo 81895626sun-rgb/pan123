@@ -75,3 +75,7 @@ watchdog events ──► pending_queue ──► [debounce_worker_thread] ─�
 ## Logs
 
 `upload.log` (INFO+) and `error.log` (ERROR+ only) are written to cwd via a root-logger `FileHandler` configured in `monitor.py`. Both are append-mode and grow unbounded — `upload.log` is already multi-MB in the repo's working tree.
+
+## 排错参考
+
+云盘 API / 上传 / 登录相关的历史错误与修复记录见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。遇到 123 返回 404 或非 JSON、115 上传 405、cookie 退出后失效、或 p115client / p115oss 升级后参数报错时，先查该文档对应章节。
