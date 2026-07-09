@@ -78,4 +78,4 @@ watchdog events ──► pending_queue ──► [debounce_worker_thread] ─�
 
 ## 排错参考
 
-云盘 API / 上传 / 登录相关的历史错误与修复记录见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。遇到 123 返回 404 或非 JSON、115 上传 405、cookie 退出后失效、或 p115client / p115oss 升级后参数报错时，先查该文档对应章节。
+云盘 API / 上传 / 登录相关的历史错误与修复记录见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。遇到 123 返回 404 或非 JSON、115 上传 405、cookie 退出后失效、p115client / p115oss 升级后参数报错、或失败文件重拷后不再重传（dispatched_tasks 静默丢弃）时，先查该文档对应章节。

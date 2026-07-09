@@ -119,6 +119,102 @@ def reset_client(self, service):
 
 ---
 
+## 7. 失败文件重拷后不再重传（dispatched_tasks 永不清空）
+
+> **状态：已实施（A 回调版 + C）。** 2026-07-08 排查并落地。
+
+**症状**
+某文件上传最终失败（`❌ 【彻底放弃上传】`）后，手动重拷/重存该文件触发 watchdog，日志里反复出现 `系统事件捕获 [加入防抖队列]`，但**没有任何 `路径就绪` / `入优先级队列` / `开始处理任务` 后续**，文件永远不会再上传，直到重启守护进程。看着像"卡在防抖队列"，实际是防抖线程**静默丢弃**了重复事件。
+
+**根因**
+`monitor.py` 的 `dispatched_tasks`（line 68）是一个 `set`，记录所有已派发入优先级队列的路径，**只有 `add`（line 159），没有 `discard`/`remove`**——上传最终失败时 `upload_worker.handle_upload_failure` 也没有任何反馈回 monitor 去清它。
+
+防抖线程 `debounce_worker_thread` 从 `pending_queue` 取出路径后，**第一件事**（line 128-131）就是查 `dispatched_tasks`，命中即静默 `discard` + `task_done` + `continue`，**不打日志**：
+```python
+if filepath in monitor.dispatched_tasks:   # 派发过就在里面，失败后也没清
+    monitor.pending_tasks.discard(filepath)
+    monitor.pending_queue.task_done()
+    continue                               # 静默丢弃，日志无痕
+```
+`加入防抖队列` 是 watchdog 线程**入队前**打的（`monitor.py:95`），不代表入队后会被处理；丢弃发生在入队之后且无日志，所以症状有欺骗性。
+
+事件链：首次派发（`add`）-> 上传失败（`dispatched_tasks` 未清）-> 重拷触发 `on_created` -> 入队（打"加入防抖队列"）-> 防抖线程取出命中 `dispatched_tasks` -> 静默丢弃 -> 永远到不了上传队列。重启进程是临时解（清空 `dispatched_tasks`），但根因不除则每个失败文件都会复发。
+
+**修复方案（A 回调版 + C，已落地）**
+
+**C：消除静默**——丢弃时打日志，使症状可观测。`monitor.py:128-131`：
+```python
+# before
+if filepath in monitor.dispatched_tasks:
+    monitor.pending_tasks.discard(filepath)
+    monitor.pending_queue.task_done()
+    continue
+# after
+if filepath in monitor.dispatched_tasks:
+    logging.info(f"已派发过,忽略重复事件: {filepath}")
+    monitor.pending_tasks.discard(filepath)
+    monitor.pending_queue.task_done()
+    continue
+```
+
+思路：让 `dispatched_tasks` **"失败感知"**--成功文件继续永久去重（符合本意），失败文件清掉放行。失败信号通过**回调**从 `upload_worker` 传回 monitor，不引入循环依赖。
+
+**A：彻底放弃时回调清 `dispatched_tasks`**。只在 `handle_upload_failure` 的 `else`（彻底放弃）分支触发，重试中（`if` 分支）不清，不会误删。
+
+`monitor.py` -- `SimpleFileMonitor.__init__` 加锁 + 新增方法，`start_monitoring` 启动上传线程时把方法作为回调传入：
+```python
+# __init__ 里
+self.dispatched_lock = threading.Lock()
+
+def mark_upload_failed(self, path):
+    """上传最终失败后移除已派发标记，使重拷可重新检测重传。成功文件不受影响。"""
+    with self.dispatched_lock:
+        self.dispatched_tasks.discard(path)
+
+# start_monitoring 里启动上传线程处（原 line 417），多传一个回调
+from upload_worker import upload_task_worker
+upload_thread = threading.Thread(
+    target=upload_task_worker,
+    args=(client_123, client_115, monitor.upload_queue, monitor.mark_upload_failed))
+```
+
+`upload_worker.py` -- 两个函数各加一个**可选**参数 `on_final_failure=None`，向后兼容：
+```python
+def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=None):
+    ...  # 调 handle_upload_failure 时把 on_final_failure 透传下去
+
+def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=None):
+    if task.retries < MAX_RETRIES:
+        task.retries += 1
+        upload_queue.put(task)             # 重试：不清 dispatched_tasks
+        logging.info(f"♻️ 【任务排队重试】({task.retries}/{MAX_RETRIES}) ...")
+    else:                                   # 彻底放弃：回调清掉，放行重拷重试
+        logging.error(f"❌ 【彻底放弃上传】...")
+        if on_final_failure:
+            on_final_failure(task.local_path)
+        log_failed_task(task, error_msg)
+        upload_queue.task_done()
+```
+
+**为什么用回调（而不是传 monitor 对象）**
+- **无循环依赖**：`upload_worker` 不 import `monitor`（回调是 callable，鸭子类型）。现有 `monitor` 单向 lazy import `upload_worker` 的关系不变。
+- **向后兼容**：`on_final_failure=None` 可选，`test_client.py` 等不传也不受影响。
+- **改动面小**：2 个函数各加 1 个可选参数 + 1 个 monitor 方法 + 1 把锁。
+- **线程安全 cheap**：`set.add/discard` 在 GIL 下本就原子，锁只兜底；跨线程写只有"彻底放弃"这一处，竞态最坏结果是多重传一次，正是期望行为。
+
+**已知限制 / 注意**
+- **只清"彻底放弃"，重试中不清**：1/3、2/3 失败走 `if` 分支，`dispatched_tasks` 不动，不会误删；只有 3/3 耗尽才回调清。重试期间重拷会被忽略（此时文件还在重试，可接受）。
+- **成功文件仍永久去重**（符合本意）；本方案**覆盖不到"成功文件被删后重建"**（那种没失败过，`dispatched_tasks` 还在）--若将来需要，再叠加 mtime/TTL，属独立改进。
+- `dispatched_tasks` 对成功文件仍只增不减（`set` 不变），长期运行累积；如需可加 LRU 淘汰，属另一独立改进。
+- 目录走同一套：彻底放弃的目录任务也会被清，重拷可重试；云盘侧 `find_cid_by_parts` 命中已有 CID，无正确性问题。
+
+**再犯排查**
+- 现象"重拷失败文件不重传" -> `grep "已派发过" upload.log`（C 落地后）确认是否静默丢弃；若没这条日志说明根本没进防抖，查 watchdog。
+- `grep -n "dispatched_tasks\|mark_upload_failed\|on_final_failure" monitor.py upload_worker.py` 确认回调链路接上：彻底放弃分支调了 `on_final_failure`，monitor 的 `mark_upload_failed` 真的 `discard`。
+- 重启进程仍是临时解（清空 `dispatched_tasks`）；A 落地后失败文件重拷即可自动重传，无需重启。
+
+---
+
 ## 通用排查思路
 
 1. **先看 `error.log`（ERROR+）和 `upload.log`**，按 ERROR 消息前缀分类：`查询失败` / `请求失败` / `【彻底放弃上传】` / `[任务放弃]`。

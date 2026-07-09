@@ -57,8 +57,10 @@ def log_successful_task(task, file_id):
     )
     _get_telegram_notifier().send_message(notification)
 
-def handle_upload_failure(upload_queue, task, error_msg=None):
-    """处理上传失败的情况，包括重试或放弃"""
+def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=None):
+    """处理上传失败的情况，包括重试或放弃。
+    on_final_failure: 可选回调 path->None，仅在「彻底放弃」分支调用，让 monitor 清掉
+    dispatched_tasks，使失败文件可被重拷重新检测重传（见 troubleshooting.md #7）。"""
     if task.retries < MAX_RETRIES:
         task.retries += 1
         upload_queue.put(task)
@@ -66,12 +68,16 @@ def handle_upload_failure(upload_queue, task, error_msg=None):
     else:
         error_brief = str(error_msg)[:150].replace('\n', ' ') if error_msg else "未知错误"
         logging.error(f"❌ 【彻底放弃上传】网盘:[{task.pan_name}] | 失败文件:[{task.local_path}] | 最终错误:[{error_brief}]")
+        if on_final_failure is not None:
+            on_final_failure(task.local_path)
         log_failed_task(task, error_msg)
         upload_queue.task_done()
 
 
-def upload_task_worker(client_123, client_115, upload_queue):
-    """文件上传工作线程（完整修正版）"""
+def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=None):
+    """文件上传工作线程（完整修正版）
+    on_final_failure: 可选回调 path->None，透传给 handle_upload_failure，在彻底放弃时
+    让 monitor 清 dispatched_tasks（见 troubleshooting.md #7）。"""
     last_active_time = time.time()
     while True:
         try:
@@ -105,7 +111,7 @@ def upload_task_worker(client_123, client_115, upload_queue):
                             upload_queue.task_done()  # 仅在此处标记任务完成
                             # logging.info(f"此时队列中的任务数量是 ：{upload_queue.unfinished_tasks}")
                         else:
-                            handle_upload_failure(upload_queue, task, f"无效的API响应: {str(upload_result)[:100]}")
+                            handle_upload_failure(upload_queue, task, f"无效的API响应: {str(upload_result)[:100]}", on_final_failure=on_final_failure)
 
                     except Exception as e:
                         error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
@@ -113,7 +119,7 @@ def upload_task_worker(client_123, client_115, upload_queue):
                         _cause = e.__cause__ or e.__context__
                         if _cause:
                             logging.error(f"【上传异常根因】网盘:[123] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
-                        handle_upload_failure(upload_queue, task, error_msg)
+                        handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure)
                 elif task.pan_name == "115":
                     try:
                         upload_file(
@@ -128,7 +134,7 @@ def upload_task_worker(client_123, client_115, upload_queue):
                         _cause = e.__cause__ or e.__context__
                         if _cause:
                             logging.error(f"【上传异常根因】网盘:[115] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
-                        handle_upload_failure(upload_queue, task, error_msg)
+                        handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure)
             elif state == FileState.GROWING:
                 # 3.2 文件被锁定或正在写入
                 if task.retries < MAX_RETRIES:
@@ -138,15 +144,15 @@ def upload_task_worker(client_123, client_115, upload_queue):
                     logging.info(f"文件{state.name}，等待{wait_time}s后重试: {task.local_path}")
                     time.sleep(wait_time)
                 else:
-                    handle_upload_failure(upload_queue, task, f"超过最大重试次数（状态:{state.name}）")
+                    handle_upload_failure(upload_queue, task, f"超过最大重试次数（状态:{state.name}）", on_final_failure=on_final_failure)
 
             elif state == FileState.NOT_FOUND:
                 # 3.3 文件不存在
-                handle_upload_failure(upload_queue, task, "文件不存在")
+                handle_upload_failure(upload_queue, task, "文件不存在", on_final_failure=on_final_failure)
 
             else: #FileState.ERROR
                 # 3.4 其他错误状态
-                handle_upload_failure(upload_queue, task, "文件状态检测失败")
+                handle_upload_failure(upload_queue, task, "文件状态检测失败", on_final_failure=on_final_failure)
         
         except Empty:
             # 4. 队列空时短暂等待（避免CPU空转）

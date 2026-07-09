@@ -66,8 +66,16 @@ class SimpleFileMonitor:
         self.priority_queue = PriorityQueue(maxsize=2000) # 优先级队列：先目录后文件、深度由浅到深
         self.pending_tasks = set()                       # 防止同一路径反复加入防抖队列
         self.dispatched_tasks = set()                    # 防止同一路径重复入优先级队列
+        self.dispatched_lock = threading.Lock()          # 保护 dispatched_tasks 跨线程读写（upload_worker 失败回调会 discard）
         self.pq_sequence = 0                             # 入队自增序号，保证同优先级下 FIFO
         self.pq_lock = threading.Lock()                  # sequence 自增线程安全锁
+
+    def mark_upload_failed(self, path):
+        """上传最终失败后移除已派发标记，使该文件可被重拷重新检测重传。成功文件不受影响。
+        只在 upload_worker 的「彻底放弃」分支回调；set 的 add/discard 在 GIL 下本就原子，
+        此处加锁仅为兜底，竞态最坏结果是多重传一次（即期望的失败重试）。"""
+        with self.dispatched_lock:
+            self.dispatched_tasks.discard(path)
 
 class SimpleFileHandler(FileSystemEventHandler):
     """事件驱动版文件处理器"""
@@ -126,6 +134,7 @@ def debounce_worker_thread(client_123, client_115, monitor):
 
             # 重复入队校验
             if filepath in monitor.dispatched_tasks:
+                logging.info(f"已派发过,忽略重复事件: {filepath}")
                 monitor.pending_tasks.discard(filepath)
                 monitor.pending_queue.task_done()
                 continue
@@ -414,7 +423,7 @@ def start_monitoring(path, client_115, client_123):
 
     # 启动上传工作线程 (Upload Worker)
     from upload_worker import upload_task_worker
-    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue,))
+    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue, monitor.mark_upload_failed))
     upload_thread.daemon = True
     upload_thread.start()
 
