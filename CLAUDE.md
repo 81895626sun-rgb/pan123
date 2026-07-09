@@ -74,8 +74,8 @@ watchdog events ──► pending_queue ──► [debounce_worker_thread] ─�
 
 ## Logs
 
-`upload.log` (INFO+) and `error.log` (ERROR+ only) are written to cwd via a root-logger `FileHandler` configured in `monitor.py`. Both are append-mode and grow unbounded — `upload.log` is already multi-MB in the repo's working tree.
+`upload.log` (INFO+) and `error.log` (ERROR+ only) are written to cwd via a root-logger `FileHandler` configured in `monitor.py`. Both are append-mode and grow unbounded — `upload.log` is already multi-MB in the repo's working tree. 因 `FileHandler` 用 `mode='a'`（POSIX `O_APPEND`），从外部截断日志后容器下次写会落到新末尾，不留 NUL 空洞、无需重启（曾误以为截断会让旧 fd 偏移留洞要重启，实测不会）。
 
 ## 排错参考
 
-云盘 API / 上传 / 登录相关的历史错误与修复记录见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。遇到 123 返回 404 或非 JSON、115 上传 405、cookie 退出后失效、p115client / p115oss 升级后参数报错、或失败文件重拷后不再重传（dispatched_tasks 静默丢弃）时，先查该文档对应章节。
+云盘 API / 上传 / 登录相关的历史错误与修复记录见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。遇到 123 返回 404 或非 JSON、115 上传 405、cookie 退出后失效、p115client / p115oss 升级后参数报错、失败文件重拷后不再重传（dispatched_tasks 静默丢弃）、或 115 上传偶发 401 / IndexError 时，先查该文档对应章节。

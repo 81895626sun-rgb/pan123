@@ -215,6 +215,32 @@ def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=N
 
 ---
 
+## 8. 115 上传偶发 401 + IndexError（p115oss 解析 bug）
+
+> **状态：修复方案计划中（B + C），未实施。** 2026-07-08 排查确认。
+
+**症状**
+- 115 上传偶发 `HTTPError: HTTP Error 401: Unauthorized` 与 `IndexError: index out of bounds on dimension 1`（后者是 numpy 报错口吻，p115oss 用 numpy 做 115 OSS 协议加解密）。
+- 两个错误都来自 p115client/p115oss 内部，`upload_worker.py` 用 `e.__cause__ or e.__context__` 取出来记成「上传异常根因」。
+- 2026-07-08 实测：115 共 68 次大文件上传请求，7 个文件踩到 401/IndexError，6 个在 3 次重试内自愈，1 个（少侠逆袭攻略 S01E06.mkv）4 次全废（1×401 + 3×IndexError）耗尽重试 `彻底放弃`。
+
+**根因**（用户判断）
+- **401 = 网络 / 内部 token 抖动，不是 cookie 失活**。115 是 cookie 鉴权，无 passport+password，**代码里无法重新认证**（`reset_client`+`get_client` 只是重读同一个 cookie，换不出新会话）。瞬时 401 靠重试自愈；持续 401（cookie 真死）只能人去浏览器重抓 cookie。
+- **IndexError = p115oss 客户端 bug**，高度怀疑是 401/异常响应的「次生灾害」：115 返回异常/空响应，p115oss 没防御直接索引响应结构 -> IndexError。S01E06 先 401 后 3 次 IndexError 印证此假设。若成立，401 和 IndexError 其实是同一个问题，被 p115oss 糟糕的错误处理掩盖成 IndexError。
+
+**修复方案（B + C，计划中，未落地）**
+- **B（先做，零风险）**：补全 115 异常的完整 traceback。现在 `upload_worker.py` 只记 `__cause__` 的 `[:300]` 字符串，看不到 p115oss 哪一行炸的。改成 `logging.error(..., exc_info=True)` 或 `traceback.format_exc()`，跑一两天确认 IndexError 真身（是不是 401 化身）+ 定位 p115oss 出错行。
+- **C（后做，据 B 的数据）**：定位到 p115oss 0.1.0.3 的 bug 后，二选一 -- ① 像 `upload_init` 那样 monkeypatch（见 #2）；② 评估升级 p115oss/p115client（但要重新验证 `upload_init`/`upload_file` 签名，#2/#4/#5 都被升级坑过）。
+- **401 侧**：不可自愈，只能加可观测性 -- 连续 N 次 401 就发明确告警「115 cookie 可能失效，需手动刷新」，甚至快速失败不浪费重试。属独立小改进。
+- **D/E（可选）**：READY 态失败加指数退避 + 适度提 `MAX_RETRIES`（对 IndexError 瞬时有用，对持续 401 无用）；`failed_tasks.txt` 挂出宿主机（目前容器内写、没 bind-mount，排查拿不到）。
+
+**再犯排查**
+- 115 上传报 401/IndexError -> 先看是不是偶发（重试能过就是瞬时网络/token）；连续失败才怀疑 cookie。
+- `grep "IndexError\|401" error.log` 统计频率和涉及文件；B 落地后看完整 traceback 确认 IndexError 源头在 p115oss 哪一行。
+- 升级 p115oss/p115client 后：重验 `P115Client` 构造参数、`upload_file` 签名、`upload_init` payload（见 #2/#4/#5）。
+
+---
+
 ## 通用排查思路
 
 1. **先看 `error.log`（ERROR+）和 `upload.log`**，按 ERROR 消息前缀分类：`查询失败` / `请求失败` / `【彻底放弃上传】` / `[任务放弃]`。
