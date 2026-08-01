@@ -11,9 +11,10 @@ from pan123 import find_cid_by_parts
 from queue import Queue, PriorityQueue, Full, Empty
 from client import CloudClientManager
 import logging
-import os
-from dotenv import load_dotenv
+import sys
+from config import Config
 from utils.onestrm_notifier import OneStrmNotifier
+from utils.telegram_notifier import TelegramNotifier
 # from upload_worker import upload_task_worker
 import threading
 from file_checker import FileGrowthChecker, FileState
@@ -57,10 +58,12 @@ class UploadTask:
 
 class SimpleFileMonitor:
     """事件驱动版文件监控器（防抖 + 优先级队列）"""
-    def __init__(self, path, client_115, client_123):
+    def __init__(self, path, client_115, client_123, config, sync_trigger=None):
         self.path = path
         self.client_115 = client_115
         self.client_123 = client_123
+        self.config = config
+        self.sync_trigger = sync_trigger
         self.upload_queue = Queue(maxsize=1000)          # 最终上传队列，传递给 upload_worker
         self.pending_queue = Queue(maxsize=1000)         # 防抖队列，收集 watchdog 原始事件
         self.priority_queue = PriorityQueue(maxsize=2000) # 优先级队列：先目录后文件、深度由浅到深
@@ -168,7 +171,8 @@ def debounce_worker_thread(client_123, client_115, monitor):
                 monitor.dispatched_tasks.add(filepath)
 
                 if os.path.exists(filepath):
-                    OneStrmNotifier.trigger_qmediasync()
+                    if monitor.sync_trigger is not None:
+                        monitor.sync_trigger.trigger_qmediasync()
                     _enqueue_priority(monitor, filepath)
 
             elif state == FileState.ERROR:
@@ -192,8 +196,8 @@ def handle_file_creation_115(client, monitor, file, task=None):
     logging.info(f"115网盘处理文件创建事件，文件路径: {file}")
 
     cloud_full_path = convert_to_cloud_path(
-        local_root=os.getenv('local_root'),
-        cloud_prefix=os.getenv('cloud_prefix'),
+        local_root=monitor.config.local_root,
+        cloud_prefix=monitor.config.cloud_prefix,
         local_full_path=file
     )
     parts = [p for p in cloud_full_path.split('/') if p][:-1]
@@ -243,8 +247,8 @@ def handle_file_creation_123(client: object, monitor: object, file: str, task=No
     """
     logging.info(f"123网盘处理文件创建事件，文件路径: {file}")
     cloud_full_path = convert_to_cloud_path(
-        local_root=os.getenv('local_root'),
-        cloud_prefix=os.getenv('cloud_prefix'),
+        local_root=monitor.config.local_root,
+        cloud_prefix=monitor.config.cloud_prefix,
         local_full_path=file
     )
     parts = [p for p in cloud_full_path.split('/') if p][:-1]
@@ -299,8 +303,8 @@ def handle_dir_creation(client_123, client_115, monitor, file):
     logging.info(f"处理文件夹创建事件，文件夹路径: {file}")
     folder_name = os.path.basename(file)
     cloud_full_path = convert_to_cloud_path(
-        local_root=os.getenv('local_root'),
-        cloud_prefix=os.getenv('cloud_prefix'),
+        local_root=monitor.config.local_root,
+        cloud_prefix=monitor.config.cloud_prefix,
         local_full_path=file
     )
     # 父目录路径列表（去掉当前目录名，只保留上层）
@@ -413,9 +417,9 @@ def priority_queue_worker(client_123, client_115, monitor):
 
 
 #启动目录监控
-def start_monitoring(path, client_115, client_123):
+def start_monitoring(path, client_115, client_123, config, notifier=None, sync_trigger=None):
     """启动事件驱动版目录监控"""
-    monitor = SimpleFileMonitor(path, client_115, client_123)
+    monitor = SimpleFileMonitor(path, client_115, client_123, config, sync_trigger)
     event_handler = SimpleFileHandler(monitor)
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
@@ -423,7 +427,7 @@ def start_monitoring(path, client_115, client_123):
 
     # 启动上传工作线程 (Upload Worker)
     from upload_worker import upload_task_worker
-    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue, monitor.mark_upload_failed))
+    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue, monitor.mark_upload_failed, notifier))
     upload_thread.daemon = True
     upload_thread.start()
 
@@ -446,16 +450,41 @@ def start_monitoring(path, client_115, client_123):
     observer.join()
 
 if __name__ == "__main__":
-    import sys
-    load_dotenv()
-    target_path = os.getenv('MONITOR_DIR')
-    print(target_path)
+    config = Config.from_env()
+    print(config)
+    target_path = config.monitor_dir
     if not target_path:
         logging.error("错误: 未在 .env 文件中配置 MONITOR_DIR")
         sys.exit(1)
     if not os.path.isdir(target_path):
         logging.error(f"错误: 目录 '{target_path}' 不存在")
         sys.exit(1)
-    client_123 = CloudClientManager().get_client('123')  # 123云盘客户端
-    client_115 = CloudClientManager().get_client('115')  # 115云盘客户端
-    start_monitoring(path=target_path,client_115=client_115,client_123=client_123)
+
+    # 构造通知器（仅配置了 Telegram 凭证时才创建）
+    notifier = TelegramNotifier(config) if config.telegram_enabled else None
+    if notifier:
+        logging.info("Telegram 通知已启用")
+    else:
+        logging.info("Telegram 通知未配置，跳过")
+
+    # 构造 QMediaSync 同步触发器（仅配置了 QMediaSync 时才创建）
+    sync_trigger = OneStrmNotifier(config, notifier) if config.qmediasync_enabled else None
+    if sync_trigger:
+        logging.info("QMediaSync 同步触发器已启用 "
+                      f"(base_url={config.qmediasync_base_url}, "
+                      f"debounce={config.qmediasync_debounce_seconds}s)")
+    else:
+        logging.info("QMediaSync 未配置，跳过")
+
+    # 创建云盘客户端管理器（注入 Config，其余模块不从 env 读配置）
+    manager = CloudClientManager(config)
+    client_123 = manager.get_client('123')  # 123云盘客户端
+    client_115 = manager.get_client('115')  # 115云盘客户端
+    start_monitoring(
+        path=target_path,
+        client_115=client_115,
+        client_123=client_123,
+        config=config,
+        notifier=notifier,
+        sync_trigger=sync_trigger,
+    )

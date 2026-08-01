@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from p123client import P123Client
 from p123client.client import DEFAULT_BASE_URL
@@ -8,6 +7,8 @@ from p115client import check_response
 import atexit
 import logging
 from typing import Dict, Optional, Union
+
+from config import Config
 
 
 # 123pan 已将 API 由 www.123pan.com/b 迁移至裸域名 123pan.com。
@@ -76,9 +77,10 @@ class CloudClientManager:
         '115': None
     }
 
-    def __new__(cls):
+    def __new__(cls, config: Optional[Config] = None):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            cls._instance._config = config or Config.from_env()
             atexit.register(cls._cleanup)
         return cls._instance
 
@@ -133,8 +135,8 @@ class CloudClientManager:
 
     def _new_123_client(self) -> P123Client:
         """创建新的123云盘客户端"""
-        passport = os.getenv('P123_PASSPORT')
-        password = os.getenv('P123_PASSWORD')
+        passport = self._config.p123_passport
+        password = self._config.p123_password
         if not passport or not password:
             raise ValueError("未设置环境变量 P123_PASSPORT 或 P123_PASSWORD")
 
@@ -145,7 +147,7 @@ class CloudClientManager:
     def _new_115_client(self) -> P115Client:
         """创建新的115云盘客户端"""
         # 优先尝试从环境变量读取cookie
-        cookie = os.getenv('P115_COOKIE')
+        cookie = self._config.p115_cookie
         
         # 如果环境变量没有，尝试从文件读取
         if not cookie:

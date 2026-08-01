@@ -25,7 +25,9 @@ There is **no lint config and no test suite** — `test_client.py` is a manual l
 
 ## Configuration
 
-All runtime config lives in `.env` (see `.env.example`). Keys: `P123_PASSPORT`/`P123_PASSWORD`, `P115_COOKIE`, `local_root`, `cloud_prefix`, `MONITOR_DIR`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`/`TELEGRAM_PROXY_URL`, `QMEDIASYNC_BASE_URL`/`QMEDIASYNC_API_KEY`/`QMEDIASYNC_PATH_IDS`. The QMediaSync debounce window (`QMEDIASYNC_DEBOUNCE_SECONDS=120`) is a constant in `utils/onestrm_notifier.py`.
+All runtime config lives in `.env` (see `.env.example`). Keys: `P123_PASSPORT`/`P123_PASSWORD`, `P115_COOKIE`, `local_root`, `cloud_prefix`, `MONITOR_DIR`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`/`TELEGRAM_PROXY_URL`, `QMEDIASYNC_BASE_URL`/`QMEDIASYNC_API_KEY`/`QMEDIASYNC_PATH_IDS`, `QMEDIASYNC_DEBOUNCE_SECONDS=120`.
+
+**`config.py` is the single source for all config.** `Config.from_env()` is the only place that reads `os.getenv` / `load_dotenv`. All other modules receive config via dependency injection. `Config` is a `frozen` dataclass; `repr` masks secrets (password, cookie). `CloudClientManager` can accept a `Config` or fall back to `Config.from_env()` for backward-compat with smoke tests.
 
 ## Architecture: the 3-queue pipeline
 
@@ -67,6 +69,7 @@ watchdog events ──► pending_queue ──► [debounce_worker_thread] ─�
 
 ## Critical invariants (do not break these)
 
+- **All config goes through `config.py`.** Modules must not call `os.getenv` / `load_dotenv` directly. Receive config via constructor/parameter injection.
 - **Never route a `task` with `pan_name="123"` to the 115 handler, or vice versa.** This causes CID/FileId cross-contamination (CID 串台) and crashes the upload. `priority_queue_worker` enforces this — preserve the branch when editing.
 - **`handle_dir_creation` must NOT recurse / `os.listdir`.** Under pure watchdog mode, each child fires its own `on_created` event. Walking the dir mid-copy scans empty dirs and drops files. Only create the single directory in the cloud and cache its ID.
 - **Docker `local_root` must equal `MONITOR_DIR`.** `docker-compose.yml` maps `${MONITOR_DIR}:${MONITOR_DIR}:ro` 1:1, so the in-container path and the env var must match exactly. For SMB shares, mount on the host first.

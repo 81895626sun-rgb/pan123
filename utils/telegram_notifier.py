@@ -3,31 +3,21 @@ import os
 import requests
 import logging
 from typing import Optional, Dict, Any
-from dotenv import load_dotenv
-from pathlib import Path
 
-# 加载父目录下的.env文件
-env_path = Path(__file__).resolve().parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
 
 # 获取模块级日志记录器
 logger = logging.getLogger(__name__)
 
 class TelegramNotifier:
     """Telegram消息通知工具（支持文本/文件/重试机制/代理）"""
-    def __init__(self, 
-                 bot_token: Optional[str] = None,
-                 chat_id: Optional[str] = None,
-                 proxy_url: Optional[str] = None):
+    def __init__(self, config):
         """\
         初始化通知器\
-        :param bot_token: Telegram Bot Token (默认从.env文件读取)\
-        :param chat_id: 目标聊天ID (默认从.env文件读取)\
-        :param proxy_url: 代理服务器URL (默认从.env文件读取)\
+        :param config: Config 对象（从 config.py）\
         """
-        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        self.proxy_url = proxy_url or os.getenv("TELEGRAM_PROXY_URL")
+        self.bot_token = config.telegram_bot_token
+        self.chat_id = config.telegram_chat_id
+        self.proxy_url = config.telegram_proxy_url
         
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}/"
         if not self.bot_token or not self.chat_id:
@@ -113,12 +103,3 @@ class TelegramNotifier:
         """转义MarkdownV2特殊字符"""
         escape_chars = '_*[]()~`>#+-=|{}.!'
         return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
-
-def send_telegram_message(text: str, **kwargs) -> bool:
-    """\
-    发送Telegram消息的快捷函数\
-    :param text: 消息内容\
-    :param kwargs: 其他参数（parse_mode, disable_web_preview等）\
-    """
-    notifier = TelegramNotifier()
-    return notifier.send_message(text, **kwargs)
