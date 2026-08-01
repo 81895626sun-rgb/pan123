@@ -229,8 +229,7 @@ def find_directory_path(client, parts):
 def calculate_md5(file_path: str) -> str:
     """带进度显示的MD5计算"""
     file_size = os.path.getsize(file_path)
-    # print(f"计算MD5({file_size/1024/1024:.2f}MB)...")
-    
+
     hash_md5 = hashlib.md5()
     last_print = 0
     with open(file_path, "rb") as f:
@@ -238,10 +237,8 @@ def calculate_md5(file_path: str) -> str:
             hash_md5.update(chunk)
             if time.time() - last_print > 1:  # 每秒更新进度
                 percent = f.tell() / file_size * 100
-                # print(f"MD5进度: {percent:.1f}%", end='\r')
                 last_print = time.time()
-    
-    # print("\nMD5计算完成")
+
     return hash_md5.hexdigest()
 
 def upload_chunk(args: Tuple[int, bytes, str, int]) -> Tuple[int, Optional[str]]:
@@ -298,7 +295,6 @@ def process_upload_batch(
                     "partNumberStart": part_num,
                     "partNumberEnd": part_num + 1
                 })
-                # print("此时获取的为第"+str(part_num)+"部分的url")
                 url = prepare_parts['data']['presignedUrls'].get(str(part_num))
                 if not url:
                     raise ValueError("URL缺失")
@@ -354,8 +350,7 @@ def upload_large_video(
         # 初始化检查
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"文件不存在: {file_path}")
-        # print(f"\n开始上传: {file_name} ({file_size/1024/1024:.2f}MB)")
-        
+
         # 创建上传任务
         upload_request = client.upload_request({
             "fileName": file_name,
@@ -441,7 +436,6 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
     
     try:
         msg = f"开始上传文件: 源路径={file_source}, 父目录ID: {parent_id}"
-        # print(msg)
         logging.info(msg)
         # 处理文件路径输入
         file_obj = None
@@ -450,27 +444,22 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
             if not file_name:
                 file_name = os.path.basename(file_source)
                 msg = f"自动获取文件名: 源路径={file_source} -> 目标文件名={file_name}"
-                # print(msg)
                 logging.info(msg)
             if not file_size:
                 file_size = os.path.getsize(file_source)
                 msg = f"文件大小: {file_size} bytes"
-                # print(msg)
                 logging.info(msg)
             file_obj = open(file_source, 'rb')
             if not file_md5:
                 msg = "开始计算文件MD5..."
-                # print(msg)
                 logging.info(msg)
                 file_md5 = calculate_md5(file_source)
                 msg = f"MD5计算完成: {file_md5}"
-                # print(msg)
                 logging.info(msg)
             file_source = file_obj
 
         # 第一阶段：尝试秒传
         msg = "尝试秒传..."
-        # print(msg)
         logging.info(msg)
         fast_result = client.upload_file_fast(
             file=file_source,
@@ -482,31 +471,25 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
             **request_kwargs
         )
         if fast_result and fast_result.get('code') == 0:
-            # print(fast_result)
             # 检查Info是否为None
             if fast_result.get('data', {}).get('Info') is None:
                 msg = "秒传失败: Info为None"
-                # print(msg)
                 logging.warning(msg)
             else:
                 msg = "秒传成功！"
-                # print(msg)
                 logging.info(msg)
                 return fast_result
         else:
             msg = f"秒传失败: {fast_result.get('message', '未知错误')}"
-            # print(msg)
             logging.warning(msg)
 
         # 根据文件大小决定是否跳过直接上传阶段
         if file_size > 50*1024*1024:  # 大于50MB直接进入分片上传
             msg = "大文件检测(>50MB)，跳过直接上传阶段..."
-            print(msg)
             logging.info(msg)
         else:
             # 尝试直接上传
             msg = "秒传失败，尝试直接上传..."
-            # print(msg)
             logging.info(msg)
             direct_result = client.upload_file(
                 file=file_source,
@@ -519,17 +502,14 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
             )
             if direct_result and direct_result.get('code') == 0:
                 msg = "直接上传成功！"
-                # print(msg)
                 logging.info(msg)
                 return direct_result
             else:
                 msg = f"直接上传失败: {direct_result.get('message', '未知错误')}"
-                # print(msg)
                 logging.error(msg)
 
         # 分片上传阶段
         msg = "直接上传失败，开始分片上传..."
-        # print(msg)
         logging.info(msg)
         chunked_result = upload_large_video(
             client=client,
@@ -542,7 +522,6 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
         )
         if chunked_result:
             msg = f"分片上传结果: {chunked_result}"
-            # print(msg)
             logging.info(msg)
         return chunked_result
 
@@ -553,7 +532,6 @@ def smart_upload(client, file_source, parent_id, file_name=None, file_size=None,
         if hasattr(file_source, 'close'):
             file_source.close()
             msg = "文件句柄已关闭"
-            # print(msg)
             logging.info(msg)
 
 #115的分块读取
