@@ -2,6 +2,7 @@ import os
 import time
 import platform
 import posixpath
+from dataclasses import dataclass, field
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff
@@ -55,6 +56,18 @@ class UploadTask:
         self.file_size = 0            # 最近检测到的文件大小
         self.pan_name = pan_name      # 标识任务所属网盘（"123" 或 "115"）
         self.available_after = 0      # 时间戳：0=立即可处理，>0=需等到该时间后再取出
+
+@dataclass(order=True)
+class PriorityItem:
+    """优先级队列元素。
+    排序规则：先目录后文件(is_file) → 深度由浅到深(depth) → FIFO(seq)。
+    filepath 和 task 不参与排序比较。"""
+    is_file: int = field(compare=True)       # 0=目录, 1=文件
+    depth: int = field(compare=True)         # 路径深度（os.sep 计数）
+    seq: int = field(compare=True)           # 自增序号，保证同优先级 FIFO
+    filepath: str = field(compare=False)     # 本地绝对路径
+    task: object = field(compare=False, default=None)  # UploadTask | None
+
 
 class SimpleFileMonitor:
     """事件驱动版文件监控器（防抖 + 优先级队列）"""
@@ -122,7 +135,7 @@ def _enqueue_priority(monitor, filepath):
         seq = monitor.pq_sequence
         monitor.pq_sequence += 1
     try:
-        monitor.priority_queue.put_nowait((is_file, depth, seq, filepath))
+        monitor.priority_queue.put_nowait(PriorityItem(is_file, depth, seq, filepath))
         logging.info(f"[优先级队列] 入队: {'文件' if is_file else '目录'} depth={depth} {filepath}")
     except Full:
         logging.error(f"[优先级队列] 队列已满，丢弃: {filepath}")
@@ -234,7 +247,7 @@ def handle_file_creation_115(client, monitor, file, task=None):
         with monitor.pq_lock:
             seq = monitor.pq_sequence
             monitor.pq_sequence += 1
-        monitor.priority_queue.put((is_file, depth, seq, file, task))
+        monitor.priority_queue.put(PriorityItem(is_file, depth, seq, file, task=task))
         logging.warning(
             f"115网盘父目录未就绪，{delay}秒后重试({task.retries}/{MAX_RETRIES}): "
             f"{file}，缺失段: {remaining_path_115}"
@@ -285,7 +298,7 @@ def handle_file_creation_123(client: object, monitor: object, file: str, task=No
         with monitor.pq_lock:
             seq = monitor.pq_sequence
             monitor.pq_sequence += 1
-        monitor.priority_queue.put((is_file, depth, seq, file, task))
+        monitor.priority_queue.put(PriorityItem(is_file, depth, seq, file, task=task))
         logging.warning(
             f"123网盘父目录未就绪，{delay}秒后重试({task.retries}/{MAX_RETRIES}): "
             f"{file}，缺失段: {remaining}"
@@ -360,14 +373,9 @@ def priority_queue_worker(client_123, client_115, monitor):
         try:
             item = monitor.priority_queue.get(timeout=1.0)
 
-            # item 格式有两种：
-            # 防抖层入队：(is_file, depth, seq, filepath)          ← 新事件，无task对象
-            # 重试入队：  (is_file, depth, seq, filepath, task)    ← 带已有task对象
-            if len(item) == 4:
-                is_file, depth, seq, filepath = item
-                task = None
-            else:
-                is_file, depth, seq, filepath, task = item
+            filepath = item.filepath
+            is_file = item.is_file
+            task = item.task
 
             # 检查是否到了重试时间（退避未到期则放回队列尾部）
             if task is not None and time.time() < task.available_after:
