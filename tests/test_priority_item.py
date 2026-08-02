@@ -137,9 +137,10 @@ def test_simple_file_monitor_priority_queue_type():
     """SimpleFileMonitor.priority_queue 接受 PriorityItem 类型"""
     import tempfile
     import threading
+    from config import Config
     tmpdir = tempfile.mkdtemp()
     try:
-        m = SimpleFileMonitor(tmpdir, client_115=None, client_123=None)
+        m = SimpleFileMonitor(tmpdir, client_115=None, client_123=None, config=Config())
         # 能正常放入 PriorityItem
         m.priority_queue.put(PriorityItem(is_file=0, depth=0, seq=0, filepath="/test"))
         assert m.priority_queue.qsize() == 1
