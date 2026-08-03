@@ -1,5 +1,4 @@
 from queue import  Empty
-from pan123 import smart_upload, upload_file
 import logging
 import json
 import time
@@ -67,8 +66,9 @@ def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=N
         upload_queue.task_done()
 
 
-def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=None, notifier=None):
-    """文件上传工作线程（完整修正版）
+def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=None):
+    """文件上传工作线程（Provider 版）
+    providers: dict[str, CloudProvider]，通过 pan_name 查找对应网盘执行上传。
     on_final_failure: 可选回调 path->None，透传给 handle_upload_failure，在彻底放弃时
     让 monitor 清 dispatched_tasks（见 troubleshooting.md #7）。
     notifier: TelegramNotifier 实例（可选），用于发送上传成功/失败通知。"""
@@ -86,49 +86,23 @@ def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=No
             logging.info(f"开始处理任务: {task.local_path} 任务状态为: {task.file_state} (网盘: {task.pan_name})")  # 新增日志
             # 3. 状态机处理核心逻辑
             if state == FileState.READY:
-                if task.pan_name == "123":
-                    # 3.1 文件就绪状态 - 执行上传
-                    try:
-                        upload_result = smart_upload(
-                            client=client_123,
-                            file_source=task.local_path,
-                            parent_id=task.dir_id
-                        )
+                provider = providers.get(task.pan_name)
+                if provider is None:
+                    logging.error(f"[上传] 未知网盘 {task.pan_name}，跳过: {task.local_path}")
+                    upload_queue.task_done()
+                    continue
 
-                        # 3.1.1 验证上传结果
-                        if upload_result and (upload_result.get('data', {}).get('Info') or 
-                                            upload_result.get('data', {}).get('file_info')):
-                            file_info = upload_result['data'].get('file_info') or upload_result['data'].get('Info')
-                            file_id = file_info.get('FileId') if file_info else '未知'
-                            logging.info(f"上传成功: {task.local_path} -> 文件ID: {file_id}")
-                            log_successful_task(task, file_id, notifier=notifier)
-                            upload_queue.task_done()  # 仅在此处标记任务完成
-                            # logging.info(f"此时队列中的任务数量是 ：{upload_queue.unfinished_tasks}")
-                        else:
-                            handle_upload_failure(upload_queue, task, f"无效的API响应: {str(upload_result)[:100]}", on_final_failure=on_final_failure, notifier=notifier)
-
-                    except Exception as e:
-                        error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
-                        logging.warning(f"【上传遇阻】网盘:[123] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
-                        _cause = e.__cause__ or e.__context__
-                        if _cause:
-                            logging.error(f"【上传异常根因】网盘:[123] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
-                        handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure, notifier=notifier)
-                elif task.pan_name == "115":
-                    try:
-                        upload_file(
-                            client=client_115,
-                            file_path=task.local_path,
-                            pid=task.dir_id
-                        )
-                        log_successful_task(task, task.dir_id, notifier=notifier)
-                    except Exception as e:
-                        error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
-                        logging.warning(f"【上传遇阻】网盘:[115] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
-                        _cause = e.__cause__ or e.__context__
-                        if _cause:
-                            logging.error(f"【上传异常根因】网盘:[115] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
-                        handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure, notifier=notifier)
+                try:
+                    provider.upload(task.local_path, task.dir_id)
+                    log_successful_task(task, task.dir_id, notifier=notifier)
+                    upload_queue.task_done()
+                except Exception as e:
+                    error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')
+                    logging.warning(f"【上传遇阻】网盘:[{task.pan_name}] | 文件:[{task.local_path}] | 原因:[{error_msg}]")
+                    _cause = e.__cause__ or e.__context__
+                    if _cause:
+                        logging.error(f"【上传异常根因】网盘:[{task.pan_name}] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
+                    handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure, notifier=notifier)
             elif state == FileState.GROWING:
                 # 3.2 文件被锁定或正在写入
                 if task.retries < MAX_RETRIES:
@@ -147,7 +121,7 @@ def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=No
             else: #FileState.ERROR
                 # 3.4 其他错误状态
                 handle_upload_failure(upload_queue, task, "文件状态检测失败", on_final_failure=on_final_failure, notifier=notifier)
-        
+
         except Empty:
             # 4. 队列空时短暂等待（避免CPU空转）
             # 新增队列空完成检测
@@ -162,5 +136,3 @@ def upload_task_worker(client_123, client_115, upload_queue, on_final_failure=No
             # 5. 系统级异常处理
             logging.error(f"工作线程异常: {str(e)}", exc_info=True)
             # 注意：此处不退出循环以保持线程存活
-
-

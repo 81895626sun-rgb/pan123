@@ -92,8 +92,7 @@ check("空 Config qmediasync_enabled=False", cfg_empty.qmediasync_enabled is Fal
 print("\n── SimpleFileMonitor 接收 Config ──")
 monitor = SimpleFileMonitor(
     path="/tmp/test_monitor",
-    client_115=None,   # 不传真实 client
-    client_123=None,
+    providers={},   # empty providers dict
     config=cfg,
     sync_trigger=None,
 )

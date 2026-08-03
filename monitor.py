@@ -7,9 +7,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff
 from pan123 import convert_to_cloud_path #导入pan123中的方法
-from pan123 import find_directory_path
-from pan123 import find_cid_by_parts
 from queue import Queue, PriorityQueue, Full, Empty
+from providers import CloudProvider
 from client import CloudClientManager
 import logging
 import sys
@@ -71,10 +70,9 @@ class PriorityItem:
 
 class SimpleFileMonitor:
     """事件驱动版文件监控器（防抖 + 优先级队列）"""
-    def __init__(self, path, client_115, client_123, config, sync_trigger=None):
+    def __init__(self, path, providers, config, sync_trigger=None):
         self.path = path
-        self.client_115 = client_115
-        self.client_123 = client_123
+        self.providers = providers  # dict[str, CloudProvider]
         self.config = config
         self.sync_trigger = sync_trigger
         self.upload_queue = Queue(maxsize=1000)          # 最终上传队列，传递给 upload_worker
@@ -141,7 +139,7 @@ def _enqueue_priority(monitor, filepath):
         logging.error(f"[优先级队列] 队列已满，丢弃: {filepath}")
 
 
-def debounce_worker_thread(client_123, client_115, monitor):
+def debounce_worker_thread(monitor):
     """守护线程：循环检查 pending_queue 里的路径是否稳定，稳定后入优先级队列"""
     logging.info("防抖工作线程 (Debounce Worker) 已启动，等待底层系统事件推送...")
     while True:
@@ -201,12 +199,11 @@ def debounce_worker_thread(client_123, client_115, monitor):
 
 
 #处理新增文件
-def handle_file_creation_115(client, monitor, file, task=None):
-    """
-    115网盘文件创建：查父目录CID，找到则加上传队列，找不到则退避重试。
-    task 参数用于重试场景传入已有任务对象（保留retries计数）。
-    """
-    logging.info(f"115网盘处理文件创建事件，文件路径: {file}")
+def handle_file_creation(provider, monitor, file, task=None):
+    """统一文件创建处理：查父目录ID，找到则加上传队列，找不到则退避重试。
+    provider: CloudProvider 实例
+    task 参数用于重试场景传入已有任务对象（保留retries计数）。"""
+    logging.info(f"{provider.name}网盘处理文件创建事件，文件路径: {file}")
 
     cloud_full_path = convert_to_cloud_path(
         local_root=monitor.config.local_root,
@@ -214,79 +211,28 @@ def handle_file_creation_115(client, monitor, file, task=None):
         local_full_path=file
     )
     parts = [p for p in cloud_full_path.split('/') if p][:-1]
-    result_cid_115, remaining_path_115 = find_cid_by_parts(client, parts)
-    has_115 = not remaining_path_115
+    dir_id, remaining = provider.find_parent(parts)
+    found = not remaining
 
-    if has_115:
+    if found:
         if task is None:
-            task = UploadTask(local_path=file, is_dir=False, pan_name="115")
-        task.dir_id = result_cid_115
-        task.cloud_path = cloud_full_path
-        try:
-            monitor.upload_queue.put_nowait(task)
-            logging.info(f"文件 {file} 已加入 115 网盘上传队列")
-        except Full:
-            logging.error(f"警告：115 网盘上传队列已满，丢弃任务: {file}")
-    else:
-        # 父目录尚未同步，退避重试
-        if task is None:
-            task = UploadTask(local_path=file, is_dir=False, pan_name="115")
-            task.cloud_path = cloud_full_path
-        task.retries += 1
-        if task.retries > MAX_RETRIES:
-            logging.error(
-                f"[任务放弃] 超过最大重试次数({MAX_RETRIES}次) | 网盘=115 | "
-                f"本地路径={file} | 云端路径={cloud_full_path} | "
-                f"原因=父目录查找失败，remaining={remaining_path_115}"
-            )
-            return
-        delay = task.retries * 2
-        task.available_after = time.time() + delay
-        is_file = 1
-        depth = file.count(os.sep)
-        with monitor.pq_lock:
-            seq = monitor.pq_sequence
-            monitor.pq_sequence += 1
-        monitor.priority_queue.put(PriorityItem(is_file, depth, seq, file, task=task))
-        logging.warning(
-            f"115网盘父目录未就绪，{delay}秒后重试({task.retries}/{MAX_RETRIES}): "
-            f"{file}，缺失段: {remaining_path_115}"
-        )
-
-def handle_file_creation_123(client: object, monitor: object, file: str, task=None) -> None:
-    """
-    123网盘文件创建：查父目录ID，找到则加上传队列，找不到则退避重试。
-    task 参数用于重试场景传入已有任务对象（保留retries计数）。
-    """
-    logging.info(f"123网盘处理文件创建事件，文件路径: {file}")
-    cloud_full_path = convert_to_cloud_path(
-        local_root=monitor.config.local_root,
-        cloud_prefix=monitor.config.cloud_prefix,
-        local_full_path=file
-    )
-    parts = [p for p in cloud_full_path.split('/') if p][:-1]
-    dir_id, remaining = find_directory_path(client, parts)
-    has_123 = not remaining
-
-    if has_123:
-        if task is None:
-            task = UploadTask(local_path=file, is_dir=False, pan_name="123")
+            task = UploadTask(local_path=file, is_dir=False, pan_name=provider.name)
         task.dir_id = dir_id
         task.cloud_path = cloud_full_path
         try:
             monitor.upload_queue.put_nowait(task)
-            logging.info(f"文件 {file} 已加入 123 网盘上传队列")
+            logging.info(f"文件 {file} 已加入 {provider.name} 网盘上传队列")
         except Full:
-            logging.error(f"警告：123 网盘上传队列已满，丢弃任务: {file}")
+            logging.error(f"警告：{provider.name} 网盘上传队列已满，丢弃任务: {file}")
     else:
         # 父目录尚未同步，退避重试
         if task is None:
-            task = UploadTask(local_path=file, is_dir=False, pan_name="123")
+            task = UploadTask(local_path=file, is_dir=False, pan_name=provider.name)
             task.cloud_path = cloud_full_path
         task.retries += 1
         if task.retries > MAX_RETRIES:
             logging.error(
-                f"[任务放弃] 超过最大重试次数({MAX_RETRIES}次) | 网盘=123 | "
+                f"[任务放弃] 超过最大重试次数({MAX_RETRIES}次) | 网盘={provider.name} | "
                 f"本地路径={file} | 云端路径={cloud_full_path} | "
                 f"原因=父目录查找失败，remaining={remaining}"
             )
@@ -300,13 +246,13 @@ def handle_file_creation_123(client: object, monitor: object, file: str, task=No
             monitor.pq_sequence += 1
         monitor.priority_queue.put(PriorityItem(is_file, depth, seq, file, task=task))
         logging.warning(
-            f"123网盘父目录未就绪，{delay}秒后重试({task.retries}/{MAX_RETRIES}): "
+            f"{provider.name}网盘父目录未就绪，{delay}秒后重试({task.retries}/{MAX_RETRIES}): "
             f"{file}，缺失段: {remaining}"
         )
 
 #处理新增文件夹：只在云端建立对应目录，不遍历子项
 # watchdog 会对目录内每个新增文件/子目录单独触发事件，各自走独立处理流程
-def handle_dir_creation(client_123, client_115, monitor, file):
+def handle_dir_creation(providers, monitor, file):
     """
     纯 watchdog 模式下的目录创建处理。
     只负责在云端 fs_mkdir 建立当前目录，拿到 CID 后缓存，然后结束。
@@ -323,49 +269,22 @@ def handle_dir_creation(client_123, client_115, monitor, file):
     # 父目录路径列表（去掉当前目录名，只保留上层）
     parts = [p for p in cloud_full_path.split('/') if p][:-1]
 
-    # ── 123 网盘 ──────────────────────────────────────
-    try:
-        parent_id_123, remaining_123 = find_directory_path(client=client_123, parts=parts)
-        if remaining_123:
-            logging.error(f"123网盘找不到父目录，跳过建文件夹: {file}，缺失段: {remaining_123}")
-        else:
-            mkdir_res = client_123.fs_mkdir(folder_name, parent_id_123)
-            if 'code' in mkdir_res and mkdir_res['code'] == 0:
-                new_id = mkdir_res['data']['Info']['FileId']
-                logging.info(f"123网盘目录已创建: {file} -> id={new_id}")
+    for provider in providers.values():
+        try:
+            parent_id, remaining = provider.find_parent(parts)
+            if remaining:
+                logging.error(f"{provider.name}网盘找不到父目录，跳过建文件夹: {file}，缺失段: {remaining}")
             else:
-                logging.error(f"123网盘 fs_mkdir 失败: {mkdir_res}")
-    except Exception as e:
-        logging.error(f"123网盘创建目录异常: {file} - {e}")
-
-    # ── 115 网盘 ──────────────────────────────────────
-    try:
-        parent_id_115, remaining_115 = find_cid_by_parts(client=client_115, parts=parts)
-        if remaining_115:
-            logging.error(f"115网盘找不到父目录，跳过建文件夹: {file}，缺失段: {remaining_115}")
-        else:
-            mkdir_res = client_115.fs_mkdir(folder_name, parent_id_115)
-            if 'cid' in mkdir_res:
-                new_cid = mkdir_res['cid']
-                logging.info(f"115网盘目录已创建: {file} -> cid={new_cid}")
-                # 立即入库，避免后续子文件事件来时重复查询
-                try:
-                    from cid_db_115 import upsert_mapping
-                    upsert_mapping("/" + cloud_full_path, new_cid)
-                    logging.info(f"115目录缓写入库: /{cloud_full_path} -> {new_cid}")
-                except Exception as e:
-                    logging.warning(f"115目录入库失败（非致命）: {e}")
-            else:
-                logging.error(f"115网盘 fs_mkdir 失败: {mkdir_res}")
-    except Exception as e:
-        logging.error(f"115网盘创建目录异常: {file} - {e}")
+                provider.mkdir(folder_name, parent_id, cloud_path=cloud_full_path)
+        except Exception as e:
+            logging.error(f"{provider.name}网盘创建目录异常: {file} - {e}")
     
-def priority_queue_worker(client_123, client_115, monitor):
+def priority_queue_worker(providers, monitor):
     """
     单线程消费优先级队列：先目录后文件、深度由浅到深。
-    
+
     目录任务：直接调 handle_dir_creation 在云端建目录。
-    文件任务：调 handle_file_creation_123/115，父目录未就绪时函数内部会退避重新入队。
+    文件任务：调 handle_file_creation，父目录未就绪时函数内部会退避重新入队。
     未到重试时间的任务：放回队列尾部，短暂让出CPU，避免忙等空转。
     """
     logging.info("优先级队列消费线程 (Priority Queue Worker) 已启动...")
@@ -395,8 +314,7 @@ def priority_queue_worker(client_123, client_115, monitor):
                 if is_file == 0:
                     # 目录任务：在云端建目录
                     handle_dir_creation(
-                        client_123=client_123,
-                        client_115=client_115,
+                        providers=providers,
                         monitor=monitor,
                         file=filepath
                     )
@@ -406,12 +324,10 @@ def priority_queue_worker(client_123, client_115, monitor):
                     # task不为None 说明是某个网盘的退避重试，只发给 task.pan_name 对应的网盘
                     # 严禁将带pan_name的task传给另一个网盘，否则会发生CID串台导致上传崩溃
                     if task is None:
-                        handle_file_creation_123(client_123, monitor, filepath, task=None)
-                        handle_file_creation_115(client_115, monitor, filepath, task=None)
-                    elif task.pan_name == "123":
-                        handle_file_creation_123(client_123, monitor, filepath, task=task)
-                    elif task.pan_name == "115":
-                        handle_file_creation_115(client_115, monitor, filepath, task=task)
+                        for provider in providers.values():
+                            handle_file_creation(provider, monitor, filepath, task=None)
+                    elif task.pan_name in providers:
+                        handle_file_creation(providers[task.pan_name], monitor, filepath, task=task)
                     else:
                         logging.error(f"[优先级队列] 未知pan_name={task.pan_name}，跳过: {filepath}")
             except Exception as e:
@@ -425,9 +341,9 @@ def priority_queue_worker(client_123, client_115, monitor):
 
 
 #启动目录监控
-def start_monitoring(path, client_115, client_123, config, notifier=None, sync_trigger=None):
+def start_monitoring(path, providers, config, notifier=None, sync_trigger=None):
     """启动事件驱动版目录监控"""
-    monitor = SimpleFileMonitor(path, client_115, client_123, config, sync_trigger)
+    monitor = SimpleFileMonitor(path, providers, config, sync_trigger)
     event_handler = SimpleFileHandler(monitor)
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
@@ -435,17 +351,18 @@ def start_monitoring(path, client_115, client_123, config, notifier=None, sync_t
 
     # 启动上传工作线程 (Upload Worker)
     from upload_worker import upload_task_worker
-    upload_thread = threading.Thread(target=upload_task_worker, args=(client_123, client_115, monitor.upload_queue, monitor.mark_upload_failed, notifier))
+    upload_thread = threading.Thread(target=upload_task_worker, args=(providers, monitor.upload_queue, monitor.mark_upload_failed, notifier))
     upload_thread.daemon = True
     upload_thread.start()
 
     # 启动防抖守护线程 (Debounce Worker)
-    debounce_thread = threading.Thread(target=debounce_worker_thread, args=(client_123, client_115, monitor))
+    # 注意：debounce_worker_thread 不再需要 clients，只操作 monitor 内部队列
+    debounce_thread = threading.Thread(target=debounce_worker_thread, args=(monitor,))
     debounce_thread.daemon = True
     debounce_thread.start()
 
     # 启动优先级队列消费线程 (Priority Queue Worker)
-    pq_thread = threading.Thread(target=priority_queue_worker, args=(client_123, client_115, monitor))
+    pq_thread = threading.Thread(target=priority_queue_worker, args=(providers, monitor))
     pq_thread.daemon = True
     pq_thread.start()
 
@@ -458,6 +375,9 @@ def start_monitoring(path, client_115, client_123, config, notifier=None, sync_t
     observer.join()
 
 if __name__ == "__main__":
+    import sys
+    from providers import Pan123Provider, Pan115Provider
+
     config = Config.from_env()
     print(config)
     target_path = config.monitor_dir
@@ -484,14 +404,17 @@ if __name__ == "__main__":
     else:
         logging.info("QMediaSync 未配置，跳过")
 
-    # 创建云盘客户端管理器（注入 Config，其余模块不从 env 读配置）
     manager = CloudClientManager(config)
-    client_123 = manager.get_client('123')  # 123云盘客户端
-    client_115 = manager.get_client('115')  # 115云盘客户端
+    client_123 = manager.get_client('123')
+    client_115 = manager.get_client('115')
+
+    providers = {
+        "123": Pan123Provider(client_123),
+        "115": Pan115Provider(client_115),
+    }
     start_monitoring(
         path=target_path,
-        client_115=client_115,
-        client_123=client_123,
+        providers=providers,
         config=config,
         notifier=notifier,
         sync_trigger=sync_trigger,

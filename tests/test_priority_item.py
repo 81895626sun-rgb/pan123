@@ -19,8 +19,8 @@ def test_monitor_import_chain():
     assert hasattr(monitor, "SimpleFileMonitor")
     assert hasattr(monitor, "_enqueue_priority")
     assert hasattr(monitor, "priority_queue_worker")
-    assert hasattr(monitor, "handle_file_creation_115")
-    assert hasattr(monitor, "handle_file_creation_123")
+    assert hasattr(monitor, "handle_file_creation")
+    assert hasattr(monitor, "handle_dir_creation")
 
 
 def test_construction_without_task():
@@ -140,7 +140,7 @@ def test_simple_file_monitor_priority_queue_type():
     from config import Config
     tmpdir = tempfile.mkdtemp()
     try:
-        m = SimpleFileMonitor(tmpdir, client_115=None, client_123=None, config=Config())
+        m = SimpleFileMonitor(tmpdir, providers={}, config=Config())
         # 能正常放入 PriorityItem
         m.priority_queue.put(PriorityItem(is_file=0, depth=0, seq=0, filepath="/test"))
         assert m.priority_queue.qsize() == 1
