@@ -24,8 +24,9 @@ class Pan123Provider(CloudProvider):
         logging.info(f"123网盘目录已创建: {name} -> id={new_id}")
         return str(new_id)
 
-    def upload(self, file_path: str, parent_id: str) -> None:
-        """上传文件。失败时抛出异常，由上层重试机制处理。"""
+    def upload(self, file_path: str, parent_id: str) -> str:
+        """上传文件，返回实际文件 ID（用于成功日志）。失败时抛出异常。
+        返回值与 upload_worker.py 原逻辑一致：优先 file_info.FileId，其次 Info.FileId。"""
         result = smart_upload(
             client=self.client,
             file_source=file_path,
@@ -37,4 +38,7 @@ class Pan123Provider(CloudProvider):
             result.get('data', {}).get('file_info')
         )):
             raise RuntimeError(f"无效的API响应: {str(result)[:100]}")
-        logging.info(f"123上传成功: {file_path}")
+        file_info = result['data'].get('file_info') or result['data'].get('Info')
+        file_id = file_info.get('FileId') if file_info else '未知'
+        logging.info(f"123上传成功: {file_path} -> 文件ID: {file_id}")
+        return str(file_id)

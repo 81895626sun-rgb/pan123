@@ -93,8 +93,9 @@ def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=
                     continue
 
                 try:
-                    provider.upload(task.local_path, task.dir_id)
-                    log_successful_task(task, task.dir_id, notifier=notifier)
+                    file_id = provider.upload(task.local_path, task.dir_id)
+                    # 123 返回真实 FileId；115 返回 None，回退到 dir_id（与原逻辑一致）
+                    log_successful_task(task, file_id or task.dir_id, notifier=notifier)
                     upload_queue.task_done()
                 except Exception as e:
                     error_msg = str(e)[:150].replace('\n', ' ') + "..." if len(str(e)) > 150 else str(e).replace('\n', ' ')

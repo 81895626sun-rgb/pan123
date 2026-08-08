@@ -90,12 +90,13 @@ def test_pan123_upload_delegates():
 
     with patch("providers.pan123.smart_upload") as mock_upload:
         mock_upload.return_value = {"data": {"Info": {"FileId": 123}}}
-        p.upload("/tmp/test.txt", "parent_id")
+        file_id = p.upload("/tmp/test.txt", "parent_id")
         mock_upload.assert_called_once_with(
             client=mock_client,
             file_source="/tmp/test.txt",
             parent_id="parent_id"
         )
+        assert file_id == "123", f"upload 应返回真实 FileId，实际: {file_id}"
 
 
 def test_pan123_upload_invalid_response_raises():

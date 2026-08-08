@@ -1,11 +1,9 @@
 import os
 import time
 import platform
-import posixpath
 from dataclasses import dataclass, field
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff
 from pan123 import convert_to_cloud_path #导入pan123中的方法
 from queue import Queue, PriorityQueue, Full, Empty
 from providers import CloudProvider
