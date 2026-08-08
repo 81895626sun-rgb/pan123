@@ -10,7 +10,6 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import threading
 import tempfile
-import sqlite3
 import time
 import json
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -24,35 +23,39 @@ from queue import Queue
 # 触发条件：主线程创建连接 → 另一个线程执行查询
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_cross_thread_sqlite_crashes():
-    """Bug #1: check_same_thread=True 时，跨线程使用同一连接会抛 ProgrammingError。
+def test_cross_thread_sqlite_does_not_crash():
+    """Bug #1 修复验证：cid_db_115 连接 check_same_thread=False，跨线程读写不崩。
 
-    预期行为：当前代码会崩溃（证明 bug 存在）。
-    修复后：应设 check_same_thread=False 或使用连接池。
+    修复前：模块级连接默认 check_same_thread=True，主线程创建后被 worker 线程
+    使用会抛 ProgrammingError。
+    修复后：check_same_thread=False + RLock 串行化，跨线程安全。
     """
-    # 模拟 cid_db_115 的模式：模块级全局连接
-    conn = sqlite3.connect(":memory:")  # check_same_thread=True（默认）
-    conn.execute("CREATE TABLE test (id INTEGER)")
+    import cid_db_115
 
-    error_from_thread = []
+    # 修复后连接用 check_same_thread=False（源码层面），
+    # 这里直接验证核心行为：多线程并发 upsert + get 不应抛 ProgrammingError
+    cid_db_115.get_connection()
 
-    def query_from_other_thread():
+    errors = []
+    results = []
+
+    def worker(i):
         try:
-            conn.execute("SELECT * FROM test")
-        except sqlite3.ProgrammingError as e:
-            error_from_thread.append(str(e))
+            cid_db_115.upsert_mapping(f"/thread/{i}", str(i))
+            got = cid_db_115.get_cid(f"/thread/{i}")
+            results.append((i, got))
+        except Exception as e:
+            errors.append((i, type(e).__name__, str(e)))
 
-    t = threading.Thread(target=query_from_other_thread)
-    t.start()
-    t.join()
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    # 当前代码行为：跨线程访问会触发 ProgrammingError
-    assert len(error_from_thread) > 0, (
-        "预期：跨线程 SQLite 查询应抛出 ProgrammingError（check_same_thread=True）\n"
-        "如果此断言失败，说明 SQLite 版本或配置已允许跨线程，Bug #1 可能已修复"
-    )
-    assert "SQLite objects created in a thread" in error_from_thread[0] or \
-           "thread" in error_from_thread[0].lower()
+    assert not errors, f"跨线程 SQLite 操作不应崩溃: {errors[:3]}"
+    for i, got in results:
+        assert got == str(i), f"线程 {i} 写入/读取不一致: {got}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -308,8 +311,8 @@ def test_growing_backoff_sequence_unchanged():
 
 def run_all():
     tests = [
-        # Bug #1: 跨线程 SQLite
-        ("Bug#1 跨线程SQLite崩溃", test_cross_thread_sqlite_crashes),
+        # Bug #1: 跨线程 SQLite（已修复）
+        ("Bug#1 跨线程SQLite不崩溃", test_cross_thread_sqlite_does_not_crash),
         # Bug #2: find_cid_by_parts 空响应（已修复）
         ("Bug#2 空响应不崩溃", test_find_cid_by_parts_empty_response_no_crash),
         ("Bug#2 缺data字段不崩溃", test_find_cid_by_parts_missing_data_key_no_crash),
