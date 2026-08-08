@@ -131,8 +131,8 @@ def find_cid_by_parts(client, parts: list) -> Tuple[int, list]:
                         break
                     else:
                         logging.error(f"失败返回的response为{response}")
-                        error_msg = response.get("error", "Unknown error")
-                        errNo = response.get("errNo", "Unknown")
+                        error_msg = response.get("error", "Unknown error") if isinstance(response, dict) else "Unknown error"
+                        errNo = response.get("errNo", "Unknown") if isinstance(response, dict) else "Unknown"
                         logging.error(f"请求失败（{retry_count + 1}/{max_retries}），错误码：{errNo}，错误信息：{error_msg}")
                         raise RequestException(f"API Error: {error_msg}")  # 触发重试
 
@@ -143,13 +143,15 @@ def find_cid_by_parts(client, parts: list) -> Tuple[int, list]:
             
             # 如果仍然失败或无数据，终止当前层查询
             # 最终检查是否成功
-            if retry_count >= max_retries and (response is None or not response.get("state") or response.get("errNo") != 0):
-                logging.error(f"重试 {max_retries} 次后仍失败，最终错误码：{response.get('errNo', 'Unknown')}")
+            if retry_count >= max_retries and (response is None or not isinstance(response, dict) or not response.get("state") or response.get("errNo") != 0):
+                err_no = response.get('errNo', 'Unknown') if isinstance(response, dict) else 'Unknown'
+                logging.error(f"重试 {max_retries} 次后仍失败，最终错误码：{err_no}")
+                break  # 终止当前层查询，返回 remaining → 上层退避重试（不再崩溃）
             else:
                 logging.info("请求成功！")
-            
-            # 遍历查询结果
-            for item in response['data']:
+
+            # 遍历查询结果（response 已确认有效；get('data', []) 双保险防缺字段）
+            for item in response.get('data', []):
                 if isinstance(item, dict) and item['n'] == current_part:
                     current_id = item['cid']
                     remaining_parts.pop(0)  # 移除已找到的部分
@@ -164,7 +166,7 @@ def find_cid_by_parts(client, parts: list) -> Tuple[int, list]:
                     break
 
             
-            if found or len(response['data']) < 28:
+            if found or len(response.get('data', [])) < 28:
                 break  # 找到目标或已查完所有数据
             
             offset += 28  # 继续查询下一页

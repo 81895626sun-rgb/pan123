@@ -61,58 +61,43 @@ def test_cross_thread_sqlite_crashes():
 # 重试 3 次后 response 可能为 None 或缺少 data 字段，直接崩溃
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_find_cid_by_parts_empty_response_crash():
-    """Bug #2: fs_files 重试 3 次后返回 None → response['data'] 触发 TypeError。
+def test_find_cid_by_parts_empty_response_no_crash():
+    """Bug #2 修复验证：fs_files 返回 None 不崩溃，返回 remaining 走退避重试。
 
-    当前预期：崩溃（证明 bug 存在）。
-    修复后：应在访问 response['data'] 前判空，安全 fallback。
+    修复前：response.get() 在 None 上 AttributeError / response['data'] TypeError。
+    修复后：干净返回 (current_id, 非空 remaining) → 上层退避重试。
     """
-    # 模拟 client.fs_files 始终返回 None（或缺少 data 字段）
+    # 模拟 client.fs_files 始终返回 None
     mock_client = MagicMock()
     mock_client.fs_files.return_value = None
 
     from pan123 import find_cid_by_parts
 
-    try:
-        find_cid_by_parts(mock_client, ["folder1", "folder2"])
-        crashed = False
-    except (TypeError, KeyError) as e:
-        crashed = True
-        error_type = type(e).__name__
-    except Exception as e:
-        # 其他异常（如 RequestException 重试循环）也接受
-        crashed = True
-        error_type = type(e).__name__
+    current_id, remaining = find_cid_by_parts(mock_client, ["folder1", "folder2"])
 
-    assert crashed, (
-        "预期：find_cid_by_parts 在 client.fs_files 返回 None 时应崩溃\n"
-        "（TypeError: 'NoneType' object is not subscriptable）\n"
-        "如果此断言失败，说明代码已修复 #2"
+    assert remaining == ["folder1", "folder2"], (
+        f"修复后应返回全部 remaining（父目录未找到，走退避重试），实际: {remaining}"
     )
-    print(f"    崩溃类型: {error_type}（预期内）")
+    assert not isinstance(current_id, type(None)) or current_id == 0, "current_id 应为 0（根目录）"
 
 
-def test_find_cid_by_parts_missing_data_key():
-    """Bug #2 变体：response 缺少 data 字段 → KeyError"""
+def test_find_cid_by_parts_missing_data_key_no_crash():
+    """Bug #2 修复验证：response 缺 data 字段不崩溃，返回 remaining。
+
+    修复前：response['data'] KeyError。
+    修复后：get('data', []) 空列表，未找到 → 返回 remaining。
+    """
     mock_client = MagicMock()
-    # 返回一个看起来成功的响应但不含 data 字段
-    response = {"state": True, "errNo": 0}  # 没有 "data"
+    response = {"state": True, "errNo": 0}  # 成功标志但没有 "data" 字段
     mock_client.fs_files.return_value = response
 
     from pan123 import find_cid_by_parts
 
-    try:
-        find_cid_by_parts(mock_client, ["folder1"])
-        crashed = False
-    except (KeyError, TypeError) as e:
-        crashed = True
-        error_type = type(e).__name__
+    current_id, remaining = find_cid_by_parts(mock_client, ["folder1"])
 
-    assert crashed, (
-        "预期：find_cid_by_parts 在 response 缺少 'data' 字段时应崩溃（KeyError）\n"
-        "如果此断言失败，说明代码已修复"
+    assert remaining == ["folder1"], (
+        f"响应缺 data 字段时不应崩溃，应返回 remaining 走退避重试，实际: {remaining}"
     )
-    print(f"    崩溃类型: {error_type}（预期内）")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,9 +310,9 @@ def run_all():
     tests = [
         # Bug #1: 跨线程 SQLite
         ("Bug#1 跨线程SQLite崩溃", test_cross_thread_sqlite_crashes),
-        # Bug #2: find_cid_by_parts 空响应
-        ("Bug#2 空响应TypeError", test_find_cid_by_parts_empty_response_crash),
-        ("Bug#2 缺少data字段KeyError", test_find_cid_by_parts_missing_data_key),
+        # Bug #2: find_cid_by_parts 空响应（已修复）
+        ("Bug#2 空响应不崩溃", test_find_cid_by_parts_empty_response_no_crash),
+        ("Bug#2 缺data字段不崩溃", test_find_cid_by_parts_missing_data_key_no_crash),
         # Bug #4: import 时 monkey-patch
         ("Bug#4 monkey-patch已应用", test_monkey_patch_is_applied),
         ("Bug#4 appversion注入", test_monkey_patch_injects_appversion),
