@@ -12,5 +12,9 @@ services:
       - ./data/upload_state.db:/app/upload_state.db
       - ./data/upload.log:/app/upload.log
       - ./data/error.log:/app/error.log
+      # failed_tasks.txt 需持久化：容器重启不丢失败任务记录。
+      # 注意：bind-mount 单文件要求宿主先存在该文件（否则 Docker 会创建成目录），
+      # 部署时若没有，先 touch ./data/failed_tasks.txt 再 docker compose up -d。
+      - ./data/failed_tasks.txt:/app/failed_tasks.txt
       - ${MONITOR_DIR}:${MONITOR_DIR}:ro
     restart: unless-stopped
