@@ -56,6 +56,7 @@ def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=N
     if task.retries < MAX_RETRIES:
         task.retries += 1
         upload_queue.put(task)
+        upload_queue.task_done()  # 保持 unfinished_tasks 平衡（get 后 put 需配对 task_done，否则每次失败重试净 +1 泄漏）
         logging.info(f"♻️ 【任务排队重试】({task.retries}/{MAX_RETRIES}) | 网盘:[{task.pan_name}] | 文件:[{task.local_path}]")
     else:
         error_brief = str(error_msg)[:150].replace('\n', ' ') if error_msg else "未知错误"

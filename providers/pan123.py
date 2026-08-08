@@ -41,4 +41,5 @@ class Pan123Provider(CloudProvider):
         file_info = result['data'].get('file_info') or result['data'].get('Info')
         file_id = file_info.get('FileId') if file_info else '未知'
         logging.info(f"123上传成功: {file_path} -> 文件ID: {file_id}")
-        return str(file_id)
+        # FileId 缺失时返回空串，让 worker 的 `file_id or task.dir_id` 回退到 dir_id
+        return str(file_id) if file_id else ""

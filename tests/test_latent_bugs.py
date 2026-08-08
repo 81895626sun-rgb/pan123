@@ -309,6 +309,34 @@ def test_growing_backoff_sequence_unchanged():
 # Runner
 # ══════════════════════════════════════════════════════════════════════════════
 
+def test_upload_failure_retry_keeps_count_balanced():
+    """遍历审查发现：上传失败重试分支 unfinished_tasks 泄漏。
+
+    修复前：handle_upload_failure 失败重试 put(task) 不配 task_done()，
+    每次失败重试 unfinished_tasks 净 +1，导致队列空完成检测永不触发、
+    queue.join() 永久阻塞。
+    """
+    from monitor import UploadTask
+    from upload_worker import handle_upload_failure
+
+    q = Queue()
+    task = UploadTask(local_path="/tmp/x.txt", is_dir=False, pan_name="123")
+    task.retries = 0
+    q.put(task)  # 初始入队：unfinished=1, qsize=1
+
+    # 模拟 worker 循环：get → 上传失败 → 重试（3 次）
+    for _ in range(3):
+        got = q.get()  # get: qsize-1, unfinished 不减
+        handle_upload_failure(q, got, "上传失败", None, None)  # 失败重试
+
+    # 正确行为：unfinished_tasks 应 == qsize（每个在队任务 1 个未完成计数）
+    assert q.unfinished_tasks == q.qsize(), (
+        f"失败重试后 unfinished_tasks 应等于 qsize（计数平衡），"
+        f"实际 unfinished={q.unfinished_tasks} qsize={q.qsize()}，"
+        f"泄漏 {q.unfinished_tasks - q.qsize()} 个"
+    )
+
+
 def run_all():
     tests = [
         # Bug #1: 跨线程 SQLite（已修复）
@@ -326,6 +354,8 @@ def run_all():
         ("Bug#6 不阻塞就绪文件", test_growing_available_after_does_not_block_ready),
         ("Bug#6 退避未到期不入队上传", test_growing_backoff_respects_available_after),
         ("Bug#6 退避序列不变", test_growing_backoff_sequence_unchanged),
+        # 遍历审查发现：失败重试分支 unfinished_tasks 泄漏
+        ("计数平衡-失败重试", test_upload_failure_retry_keeps_count_balanced),
     ]
 
     passed = 0
