@@ -79,6 +79,15 @@ def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=
             # 1. 从队列获取任务（1秒超时避免永久阻塞）
             task = upload_queue.get(timeout=1)
             last_active_time = time.time()  # 重置活跃时间
+
+            # 1.5 GROWING 退避未到期：放回队尾让出线程（单线程穿插处理其他就绪文件），
+            # 不放 sleep 阻塞。注意：必须在 check_growth 之前检查，避免白跑文件检测。
+            if task.available_after and time.time() < task.available_after:
+                upload_queue.put(task)
+                upload_queue.task_done()
+                time.sleep(1)
+                continue
+
             # 2. 检查文件状态（返回状态枚举和当前大小）
             state, current_size = FileGrowthChecker.check_growth(task.local_path)
             task.file_state = state
@@ -105,13 +114,15 @@ def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=
                         logging.error(f"【上传异常根因】网盘:[{task.pan_name}] | 文件:[{task.local_path}] | {type(_cause).__name__}: {str(_cause)[:300]}")
                     handle_upload_failure(upload_queue, task, error_msg, on_final_failure=on_final_failure, notifier=notifier)
             elif state == FileState.GROWING:
-                # 3.2 文件被锁定或正在写入
+                # 3.2 文件被锁定或正在写入：设退避时间戳后放回队尾，
+                # 不 sleep 阻塞单线程（否则队列里其他就绪文件会干等 30-120s）
                 if task.retries < MAX_RETRIES:
                     task.retries += 1
-                    upload_queue.put(task)  # 重新入队等待重试
                     wait_time = min(120, task.retries * 30)  # 指数退避上限120秒
-                    logging.info(f"文件{state.name}，等待{wait_time}s后重试: {task.local_path}")
-                    time.sleep(wait_time)
+                    task.available_after = time.time() + wait_time
+                    upload_queue.put(task)
+                    upload_queue.task_done()  # 保持 unfinished_tasks 平衡（原代码漏了这行，导致计数泄漏）
+                    logging.info(f"文件{state.name}，{wait_time}s后重试: {task.local_path}")
                 else:
                     handle_upload_failure(upload_queue, task, f"超过最大重试次数（状态:{state.name}）", on_final_failure=on_final_failure, notifier=notifier)
 

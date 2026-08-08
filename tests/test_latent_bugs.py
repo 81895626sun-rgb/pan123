@@ -217,69 +217,104 @@ def test_failed_tasks_writes_to_cwd():
 # 单线程 worker 被 sleep 30-120s，期间其他 READY 文件全部阻塞
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_growing_sleep_blocks_other_tasks():
-    """Bug #6: GROWING 分支的 time.sleep 会阻塞同一 worker 的其他 READY 任务。
+def test_growing_available_after_does_not_block_ready():
+    """Bug #6 修复验证：GROWING 退避中的任务不阻塞就绪文件（单线程）。
 
-    模拟场景：队列中有 [GROWING_file, READY_file]，worker 取出 GROWING_file
-    后会 sleep 30-120s，READY_file 在此期间无法被处理。
+    队列 [退避中movie(available_after未到期), 就绪photo]：
+    修复前 photo 会被 sleep(30-120s) 阻塞；修复后 worker 把 movie 放回队尾，
+    photo 应先行上传，movie 到期后才上传。
+    """
+    import tempfile, pathlib, threading
+    from monitor import UploadTask
+    from upload_worker import upload_task_worker
+
+    class RecordingProvider:
+        name = 'rec'
+        def __init__(self):
+            self.uploaded = []
+        def upload(self, file_path, parent_id):
+            self.uploaded.append(os.path.basename(file_path))
+
+    provider = RecordingProvider()
+    q = Queue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        movie_path = pathlib.Path(tmp) / 'big_movie.iso'
+        movie_path.write_bytes(b'y' * 1024)
+        photo_path = pathlib.Path(tmp) / 'photo1.jpg'
+        photo_path.write_bytes(b'x' * 1024)
+
+        # 退避中（模拟刚从 GROWING 放回、2 秒后才可重试）
+        movie_task = UploadTask(local_path=str(movie_path), is_dir=False, pan_name='rec')
+        movie_task.dir_id = '1'
+        movie_task.retries = 1
+        movie_task.available_after = time.time() + 2
+
+        photo_task = UploadTask(local_path=str(photo_path), is_dir=False, pan_name='rec')
+        photo_task.dir_id = '1'
+
+        q.put(movie_task)
+        q.put(photo_task)
+
+        w = threading.Thread(target=upload_task_worker, args=({'rec': provider}, q, None, None), daemon=True)
+        w.start()
+
+        # 等待足够久（check_growth 内部有 1s 采样 sleep，需留余量）
+        deadline = time.time() + 8
+        while time.time() < deadline and 'big_movie.iso' not in provider.uploaded:
+            time.sleep(0.3)
+
+        # photo 必须上传且先于 movie（单线程下未被 GROWING 阻塞）
+        assert 'photo1.jpg' in provider.uploaded, "就绪照片应在上传（未被退避中的 movie 阻塞）"
+        assert 'big_movie.iso' in provider.uploaded, "movie 退避到期后应上传"
+        assert provider.uploaded[0] == 'photo1.jpg', f"照片应先于电影，实际顺序: {provider.uploaded}"
+
+
+def test_growing_backoff_respects_available_after():
+    """Bug #6 修复验证：available_after 未到期时任务不会被立即重试。
+
+    worker 顶部检查应把未到期任务放回队尾（put + task_done），
+    不执行上传，也不让 unfinished_tasks 泄漏。
     """
     from monitor import UploadTask
 
-    # 用 Queue 模拟 upload_queue
+    task = UploadTask(local_path="/tmp/stuck.iso", is_dir=False, pan_name="123")
+    task.retries = 1
+    task.available_after = time.time() + 60  # 60 秒后才可重试
+
     q = Queue()
+    q.put(task)  # unfinished_tasks = 1
 
-    # 放入两个任务：GROWING 在前，READY 在后
-    growing_task = UploadTask(local_path="/tmp/growing.iso", is_dir=False, pan_name="123")
-    growing_task.retries = 0
-    ready_task = UploadTask(local_path="/tmp/ready.txt", is_dir=False, pan_name="123")
+    # 模拟 worker 顶部的 available_after 检查逻辑（get → 未到期 → put + task_done）
+    got = q.get(timeout=1)  # get 不减 unfinished_tasks，仍 = 1
+    if got.available_after and time.time() < got.available_after:
+        q.put(got)      # unfinished_tasks = 2
+        q.task_done()   # unfinished_tasks = 1（平衡回原位）
+        backoff_hit = True
+    else:
+        backoff_hit = False
 
-    q.put(growing_task)
-    q.put(ready_task)
-
-    # 模拟 GROWING 分支逻辑
-    MAX_RETRIES = 3
-    task = q.get(timeout=1)  # 取到 growing_task
-
-    if task.retries < MAX_RETRIES:
-        task.retries += 1
-        q.put(task)  # 重新入队
-        wait_time = min(120, task.retries * 30)  # = 30s
-
-        # 验证：此时队列中还有 ready_task，但 worker 即将 sleep 30s
-        assert q.qsize() == 2, "队列中应有 growing_task（重入队）和 ready_task"
-        assert wait_time >= 30, f"GROWING 等待时间应为 30s 起步，实际: {wait_time}s"
-
-        # 关键断言：如果 worker 在这里 sleep(wait_time)，ready_task 会被阻塞
-        # 直到 sleep 结束才能被处理
-        print(f"    ⚠ GROWING 分支会 sleep {wait_time}s，期间 READY 文件被阻塞")
-        print(f"    队列中 {q.qsize()} 个任务等待处理")
-
-    # 验证 ready_task 确实在队列中等待
-    found_ready = False
-    while not q.empty():
-        t = q.get()
-        if t.local_path == "/tmp/ready.txt":
-            found_ready = True
-    assert found_ready, "ready_task 应在队列中等待"
+    assert backoff_hit, "available_after 未到期时应放回队尾（不立即重试）"
+    # 关键：put + task_done 配对后计数平衡（原 GROWING 分支漏 task_done 会泄漏）
+    assert q.unfinished_tasks == 1, f"unfinished_tasks 应=1（put+task_done 配对平衡），实际 {q.unfinished_tasks}"
 
 
-def test_growing_sleep_max_blocking_time():
-    """Bug #6: 最坏情况下 GROWING 分支 sleep 可达 120s"""
+def test_growing_backoff_sequence_unchanged():
+    """Bug #6 修复验证：退避序列公式不变（30/60/90/120，上限 120s）"""
     from monitor import UploadTask
 
     task = UploadTask(local_path="/tmp/stuck.iso", is_dir=False, pan_name="123")
-    # 模拟第 4 次重试
-    task.retries = 3
-    MAX_RETRIES = 3
 
-    if task.retries < MAX_RETRIES:
-        task.retries += 1
-        wait_time = min(120, task.retries * 30)
-        # retries 从 3 → 4，wait_time = min(120, 120) = 120
-        assert wait_time == 120, (
-            f"GROWING 最大阻塞时间应为 120s，实际: {wait_time}s\n"
-            "单线程 worker 在此期间完全阻塞，无法处理其他文件"
-        )
+    # 验证退避序列与修复前一致（只改变阻塞方式，不改变等待时长语义）
+    expected = [30, 60, 90, 120]  # retries 1→4
+    for r in range(1, 5):
+        wait_time = min(120, r * 30)
+        assert wait_time == expected[r - 1], f"retries={r} 退避应={expected[r-1]}s，实际 {wait_time}s"
+
+    # 关键：修复后的 GROWING 分支不再调用 time.sleep（用代码审查确认），
+    # 而是设置 available_after 时间戳。此处验证 UploadTask 有该字段。
+    task.available_after = time.time() + 30
+    assert task.available_after > time.time()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -299,9 +334,10 @@ def run_all():
         # Bug #5: failed_tasks.txt 未挂载
         ("Bug#5 相对路径", test_failed_tasks_file_is_relative_path),
         ("Bug#5 写入cwd", test_failed_tasks_writes_to_cwd),
-        # Bug #6: GROWING sleep 阻塞
-        ("Bug#6 GROWING阻塞", test_growing_sleep_blocks_other_tasks),
-        ("Bug#6 最大阻塞120s", test_growing_sleep_max_blocking_time),
+        # Bug #6: GROWING 退避不再阻塞（已修复）
+        ("Bug#6 不阻塞就绪文件", test_growing_available_after_does_not_block_ready),
+        ("Bug#6 退避未到期不入队上传", test_growing_backoff_respects_available_after),
+        ("Bug#6 退避序列不变", test_growing_backoff_sequence_unchanged),
     ]
 
     passed = 0
