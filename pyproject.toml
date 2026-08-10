@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# pythonpath="." 替代各测试文件里的 sys.path.insert，让 pytest 直接收集 tests/
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

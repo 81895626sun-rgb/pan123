@@ -113,11 +113,21 @@ def test_monkey_patch_is_applied():
 
     这不是测试 bug 是否触发，而是记录当前行为。
     p115oss 升级后注册签名变化会导致静默错误。
+
+    pytest 下其他测试可能已提前 import client（patch 全局生效），
+    故先 reload p115oss.upload 恢复原函数、移除 client 模块缓存后重新导入，
+    保证对比的是"patch 前原始函数"与"patch 后函数"（不依赖执行顺序）。
     """
+    import importlib
+    import sys
     import p115oss.upload
+
+    # 恢复原函数（若已被此前 import client 的测试 patch 过）
+    importlib.reload(p115oss.upload)
     original_func = p115oss.upload.upload_init
 
-    # 导入 client 会触发 monkey-patch（模块级代码执行）
+    # 移除 client 缓存强制重新执行其模块级 monkey-patch
+    sys.modules.pop("client", None)
     import client
 
     patched_func = p115oss.upload.upload_init
