@@ -1,0 +1,12 @@
+# 统一换行符：文本文件入库 LF、检出也 LF（所有平台）。
+# eol=lf 覆盖 Windows 默认 autocrlf=true 的 CRLF 检出，消除 LF→CRLF 警告。
+* text=auto eol=lf
+
+# 二进制文件禁止转换
+*.db binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pyc binary
