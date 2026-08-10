@@ -10,3 +10,6 @@ p115oss==0.1.0.3
 # 固定 python-concurrenttools: 0.1.5 (2026-07-07) 移除了 Return,
 # 而 p115client 0.0.9.3.7 的 tool/upload.py 要 from concurrenttools import Return, 会 ImportError
 python-concurrenttools==0.1.4
+# 固定 python-asynctools: 0.2.x (2026-08-10) 移除了 to_list,
+# 而 p115client 0.0.9.3.7 的 tool/iterdir.py 要 from asynctools import to_list, 会 ImportError
+python-asynctools==0.1.4
