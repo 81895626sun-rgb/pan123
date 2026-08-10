@@ -17,6 +17,7 @@ build/
 .vscode/
 .idea/
 .claude/
+.omc/
 
 # 数据库
 *.db
