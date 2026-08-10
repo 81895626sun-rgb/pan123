@@ -1,0 +1,35 @@
+name: Run Unit Tests
+
+# 触发条件:
+#   - push 到任意分支: 每个分支的提交都跑单元测试, 失败即红
+#   - pull_request 到 main: PR 合并前守护
+#   - workflow_dispatch: 手动触发
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # pytest 只装在 CI, 不进 requirements.txt(不污染生产镜像, .dockerignore 已排 tests/)
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest
+
+      - name: Run unit tests (pytest)
+        # 纯单元测试: 假 env 注入 + mock, 零网络、零真实凭证。
+        # 冒烟测试 (tests/test_115_api.py / test_123_api.py) 是 main() 格式,
+        # pytest 不会收集, 故不会触真实云盘 API。CI 无 .env 也通过。
+        run: pytest tests/
