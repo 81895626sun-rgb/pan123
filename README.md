@@ -40,10 +40,27 @@ python monitor.py
 
 ### Docker（生产形态）
 
-镜像由 GitHub Action 构建，下载 `pan123-monitor.tar` 后：
+镜像由 GitHub Action（`.github/workflows/build-image.yml`）在每次 push 到 `main` 时构建并导出 tarball（只保留最新一份）。下载方式二选一：
+
+**方式一：Actions 页面（web）**
+
+1. 打开仓库 **Actions** 页 → 左侧选 `Build and Export Docker Image`
+2. 点最新一次 `success` 的 run
+3. 底部 **Artifacts** → 下载 `pan123-monitor-image-<commit>`（约 80MB）
+
+**方式二：gh CLI**
 
 ```bash
-docker load -i pan123-monitor.tar
+# 查最新一次构建 run 的 ID
+gh run list --workflow "Build and Export Docker Image" --limit 1
+# 下载该 run 的镜像 artifact（--name 用上面输出的 artifact 名）
+gh run download <run-id> --name pan123-monitor-image-<commit>
+```
+
+下载后：
+
+```bash
+docker load -i pan123-monitor-image-<commit>.tar
 # .env、SQLite 库、日志、MONITOR_DIR 均 bind-mount（见 docker-compose.yml）
 docker compose up -d
 ```
