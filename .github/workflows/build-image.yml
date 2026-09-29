@@ -21,38 +21,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute short SHA
+        # 把短 SHA (前 7 位) 算出来供后续步骤复用
+        # 注意: ${GITHUB_SHA::7} 是 bash 参数展开，只在 run: 脚本里有效；
+        #       with: 块要用 ${{ steps.meta.outputs.short }} (Actions 表达式)
+        id: meta
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build Docker image
         # CI 用官方 python:3.12-slim + 官方源 (国际 runner 快); 国内华为云源留作本地构建默认值
         # 同时打 :latest 与 :<sha7> 两个 tag，部署时可锁定到具体版本
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short }}
         run: |
           docker build \
             --build-arg BASE_IMAGE=python:3.12-slim \
             --build-arg CN_MIRROR=0 \
             -t pan123-monitor:latest \
-            -t pan123-monitor:${GITHUB_SHA::7} \
+            -t pan123-monitor:${SHORT_SHA} \
             .
 
       - name: Save image to tarball
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short }}
         run: |
-          docker save pan123-monitor:${GITHUB_SHA::7} -o pan123-monitor-${GITHUB_SHA::7}.tar
-          ls -lh pan123-monitor-${GITHUB_SHA::7}.tar
+          docker save pan123-monitor:${SHORT_SHA} -o pan123-monitor-${SHORT_SHA}.tar
+          ls -lh pan123-monitor-${SHORT_SHA}.tar
           {
             echo "## 镜像压缩包"
             echo ""
-            echo "- 文件: \`pan123-monitor-${GITHUB_SHA::7}.tar\`"
-            echo "- 大小: $(du -h pan123-monitor-${GITHUB_SHA::7}.tar | cut -f1)"
+            echo "- 文件: \`pan123-monitor-${SHORT_SHA}.tar\`"
+            echo "- 大小: $(du -h pan123-monitor-${SHORT_SHA}.tar | cut -f1)"
             echo "- commit: ${{ github.sha }}"
-            echo "- tag: \`pan123-monitor:${GITHUB_SHA::7}\` (同时存在 \`:latest\`)"
+            echo "- tag: \`pan123-monitor:${SHORT_SHA}\` (同时存在 \`:latest\`)"
             echo ""
             echo "下载后导入 + 用 SHA tag 部署 (避免 latest 漂移):"
             echo '```bash'
-            echo "docker load -i pan123-monitor-${GITHUB_SHA::7}.tar"
-            echo "IMAGE_TAG=${GITHUB_SHA::7} docker compose up -d"
+            echo "docker load -i pan123-monitor-${SHORT_SHA}.tar"
+            echo "IMAGE_TAG=${SHORT_SHA} docker compose up -d"
             echo '```'
             echo ""
             echo "或仅用 latest (默认):"
             echo '```bash'
-            echo "docker load -i pan123-monitor-${GITHUB_SHA::7}.tar"
+            echo "docker load -i pan123-monitor-${SHORT_SHA}.tar"
             echo "docker compose up -d"
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
@@ -60,8 +71,8 @@ jobs:
       - name: Upload tarball as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pan123-monitor-image-${GITHUB_SHA::7}
-          path: pan123-monitor-${GITHUB_SHA::7}.tar
+          name: pan123-monitor-image-${{ steps.meta.outputs.short }}
+          path: pan123-monitor-${{ steps.meta.outputs.short }}.tar
           retention-days: 30
           if-no-files-found: error
 
@@ -87,5 +98,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: pan123-monitor-${GITHUB_SHA::7}.tar
+          files: pan123-monitor-${{ steps.meta.outputs.short }}.tar
           generate_release_notes: true
