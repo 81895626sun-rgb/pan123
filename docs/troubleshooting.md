@@ -241,6 +241,69 @@ def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=N
 
 ---
 
+## 9. 123 云盘 `file/list/new` 返回 400 "driveId is required"
+
+> **状态：已修复（绕过 `fs_list_new` + 防御性解析）。** 2026-09-29 排查并落地。
+
+**症状**
+- `file/list/new` 请求返回 `{"code":400, "data":null, "message":"driveId is required"}`。
+- 应用层表现：`查询失败: 'NoneType' object has no attribute 'get'`——因为响应里 `data` 存在但为 `null`，`response.get('data', {})` 返回的是 `None`（默认值 `{}` 只在键缺失时生效），下一行 `None.get(...)` 直接 AttributeError。然后 10 次重试后 `[任务放弃] | 原因=父目录查找失败`。
+- `user_info` 接口正常返回 `code:0`（session/token 完全有效，**不是**鉴权问题）。
+- 115 网盘完全不受影响（走秒传，不依赖 123 的 list 接口）。
+
+**根因**
+123 上游约 2026-09-07 前后把 `file/list/new` 的参数名校验改成**严格驼峰**（`driveId`、`orderBy`、`inDirectSpace`、`fileCategory`、`OnlyLookAbnormalFile`、`Page` 等），不再接受全小写。`p123client` 的 `fs_list_new` 实现里有这样一段：
+
+```python
+payload = dict_key_to_lower_merge(payload, {
+    "driveId": 0, "limit": 100, "orderBy": "file_id",
+    "orderDirection": "asc", "parentFileId": 0, "inDirectSpace": False,
+    "fileCategory": 0, "event": event, "OnlyLookAbnormalFile": 0, "Page": 1,
+})
+return self.request("file/list/new", params=payload, ...)
+```
+
+`dict_key_to_lower_merge` 把传入 payload 与默认值里所有驼峰键**统一打成小写**（`driveId` → `driveid`、`orderBy` → `orderby`、`inDirectSpace` → `indirectspace`、`fileCategory` → `filecategory`、`OnlyLookAbnormalFile` → `onlylookabnormalfile`、`Page` → `page`），然后作为 query params 发出。9/7 之前服务端对大小写不敏感所以能跑通，之后严格校验就返回 `400 "driveId is required"`，`data` 为 `null`。
+
+**关键反证（无 token 实测 `123pan.com/api/file/list/new`）**：
+
+| 请求 | 响应 |
+|---|---|
+| 不带 `Authorization` | `{"code":20101,"message":"未登录"}`（**无 `data` 字段**，不会触发崩溃 —— 排除"完全无登录态"） |
+| 带无效 Bearer token | `{"code":401,"data":null,"message":"未登录"}`（`data:null` 的来源之一，但用户 `user_info` 正常说明不是这种） |
+| 带账号实际 token + `fs_list_new` | `{"code":400,"data":null,"message":"driveId is required"}` ← **用户的真实响应** |
+
+**修复**（`pan123.py` + `tests/test_123_api.py`）
+
+绕过 `fs_list_new`，直接 `client.request` 透传驼峰键（`request` 内部不做小写化）。`pan123.py` 的 `find_directory_path`：
+
+```python
+response = client.request(
+    "file/list/new",
+    params=payload,                  # payload 已是驼峰键    base_url="https://123pan.com",
+)
+if response.get("code") != 0:
+    logging.error(
+        f"列目录失败: code={response.get('code')} "
+        f"msg={response.get('message')!r}"
+    )
+    break
+# 防御 data:null：键存在但为 None 时 .get('data', {}) 仍返回 None
+data = response.get('data') or {}
+```
+
+`tests/test_123_api.py` 的冒烟测试同样改成 `client.request("file/list/new", params=payload, base_url="https://123pan.com")`，否则 CI 测试门从 9/7 起会一直挂红。
+
+**验证脚本**（`D:\code\_archive\linshi\yunwei\` 下，只读）：
+- `diag_123_session.py`：4 次只读调用，确认 `fs_list_new` → 400、直接 `request` + 驼峰 → `code:0`。
+- `verify_after_patch.py`：8 次只读调用，模拟修复后走完 `nas → MPLink → teleplay → 国产剧 → 兰香如故 (2026) → Season 1` 整条父目录链，每层都拿到 FileId。
+
+**再犯排查**
+- 错误消息里有 `driveId is required` / `code:400` / `data:null` → 大概率是这个。
+- 看请求日志的 query string：若所有键都是小写（`driveid`/`orderby`/`indirectspace`/`filecategory`/`onlylookabnormalfile`），就是 p123client 的 `dict_key_to_lower_merge` 在作怪——**不要**依赖 `fs_list_new`，直接 `client.request`。
+- `data = response.get('data', {})` 务必加 `or {}` 防 `data:null`，并校验 `code != 0` 显式 break，避免把"参数错误"变成静默的"任务放弃"。
+- 库升级到 `p123client==0.0.9.4` **不会修这个**（`fs_list_new` 实现没变，`dict_key_to_lower_merge` 仍把所有键小写化）。依赖升级不是这个问题的解法。
+
 ## 通用排查思路
 
 1. **先看 `error.log`（ERROR+）和 `upload.log`**，按 ERROR 消息前缀分类：`查询失败` / `请求失败` / `【彻底放弃上传】` / `[任务放弃]`。

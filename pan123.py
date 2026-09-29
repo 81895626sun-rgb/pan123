@@ -201,9 +201,25 @@ def find_directory_path(client, parts):
             }
             
             try:
-                response = client.fs_list_new(payload)
-                data = response.get('data', {})
-                
+                # 123 上游 9/7 前后要求参数名严格驼峰。p123client.fs_list_new
+                # 内部 dict_key_to_lower_merge 把驼峰键打成小写，导致服务端返回
+                # code:400 "driveId is required"、data 为 null，触发崩溃。
+                # 绕过 fs_list_new，直接 client.request 透传 payload 中的驼峰键。
+                response = client.request(
+                    "file/list/new",
+                    params=payload,
+                    base_url="https://123pan.com",
+                )
+                if response.get("code") != 0:
+                    logging.error(
+                        f"列目录失败: code={response.get('code')} "
+                        f"msg={response.get('message')!r}"
+                    )
+                    break
+                # 防御 data 显式为 null：.get('data', {}) 在键存在但值为 None
+                # 时仍返回 None，下一行 None.get 会 AttributeError
+                data = response.get('data') or {}
+
                 # 在当前页数据中查找目标目录
                 for item in data.get('InfoList', []):
                     if str(item.get('Type')) == '1' and item.get('FileName') == part:
