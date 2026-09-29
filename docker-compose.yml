@@ -2,8 +2,10 @@ version: '3.8'
 
 services:
   pan123-monitor:
-    # 镜像由 GitHub Action 构建并导出为 tarball, 部署时先 docker load -i pan123-monitor.tar.gz
-    image: pan123-monitor:latest
+    # 镜像由 GitHub Action 构建并导出为 tarball (文件名含 commit SHA 前 7 位)
+    # IMAGE_TAG 默认 latest; 想锁定到具体构建版本:
+    #   IMAGE_TAG=2b1b88a docker compose up -d
+    image: pan123-monitor:${IMAGE_TAG:-latest}
     container_name: pan123-monitor
     hostname: pan123-monitor
     volumes:
