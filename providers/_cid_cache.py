@@ -49,13 +49,17 @@ class PathIdCache:
     _instances: dict[str, "PathIdCache"] = {}
     _instances_lock = threading.Lock()
 
-    def __init__(self, table_name: str, id_column: str):
-        """初始化缓存。table_name 与 id_column 必须是合法的 SQL 标识符。
+    def __init__(self, table_name: str, id_column: str, path_column: str = "path"):
+        """初始化缓存。table_name / id_column / path_column 必须是合法的 SQL 标识符。
 
         同一 table_name 只能创建一个实例；重复创建会抛 ValueError。
+
+        path_column 默认 "path"；兼容老 cid_db_115.py 表用 "dir_path"：
+            PathIdCache(table_name="dir_cid_mapping", id_column="cid", path_column="dir_path")
         """
         _check_ident(table_name, "table_name")
         _check_ident(id_column, "id_column")
+        _check_ident(path_column, "path_column")
 
         with PathIdCache._instances_lock:
             if table_name in PathIdCache._instances:
@@ -65,6 +69,7 @@ class PathIdCache:
                 )
             self.table = table_name
             self.id_col = id_column
+            self.path_col = path_column
             PathIdCache._instances[table_name] = self
 
         self._ensure_table()
@@ -89,10 +94,10 @@ class PathIdCache:
         """建表（若不存在）。所有 PathIdCache 实例共享同一连接。"""
         with self._lock:
             conn = self._get_connection()
-            # f-string 拼 DDL 是安全的：table/id_col 已被 _check_ident 校验
+            # f-string 拼 DDL 是安全的：table/id_col/path_col 已被 _check_ident 校验
             ddl = (
                 f"CREATE TABLE IF NOT EXISTS {self.table} ("
-                f"path TEXT PRIMARY KEY, "
+                f"{self.path_col} TEXT PRIMARY KEY, "
                 f"{self.id_col} TEXT NOT NULL UNIQUE, "
                 f"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 f")"
@@ -109,7 +114,7 @@ class PathIdCache:
         try:
             with self._lock:
                 cur = self._get_connection().execute(
-                    f"SELECT {self.id_col} FROM {self.table} WHERE path = ?",
+                    f"SELECT {self.id_col} FROM {self.table} WHERE {self.path_col} = ?",
                     (path,),
                 )
                 row = cur.fetchone()
@@ -131,7 +136,7 @@ class PathIdCache:
                 with self._get_connection():
                     self._get_connection().execute(
                         f"INSERT OR REPLACE INTO {self.table} "
-                        f"(path, {self.id_col}) VALUES (?, ?)",
+                        f"({self.path_col}, {self.id_col}) VALUES (?, ?)",
                         (path, id_value),
                     )
             return True
@@ -151,7 +156,7 @@ class PathIdCache:
             with self._lock:
                 with self._get_connection():
                     cur = self._get_connection().execute(
-                        f"DELETE FROM {self.table} WHERE path = ?",
+                        f"DELETE FROM {self.table} WHERE {self.path_col} = ?",
                         (path,),
                     )
                     deleted = cur.rowcount > 0

@@ -14,8 +14,10 @@ from providers.base import CloudProvider
 from pan123 import upload_file
 
 
-# 115 专用缓存：复用原 cid_db_115 的 dir_cid_mapping 表（保证已有数据兼容）
-_cache = PathIdCache(table_name="dir_cid_mapping", id_column="cid")
+# 115 专用缓存：复用原 cid_db_115 的 dir_cid_mapping 表（保证已有数据兼容）。
+# path_column="dir_path" 是原 cid_db_115.py 的列名，必须保持一致，
+# 否则 115 在已部署环境会撞 "table has no column named path"。
+_cache = PathIdCache(table_name="dir_cid_mapping", id_column="cid", path_column="dir_path")
 
 
 class Pan115Provider(CloudProvider):

@@ -204,6 +204,61 @@ def test_different_table_names_can_coexist():
         assert c_115.get("/path/a") == "cid_115"
 
 
+def test_path_column_parameterized():
+    """path_column 参数可定制：兼容老 cid_db_115.py 用 'dir_path' 列名"""
+    with _IsolatedCache():
+        # 用 dir_path 当 path 列名（与原 cid_db_115.py 一致）
+        c = PathIdCache(
+            table_name="legacy_dir_cid_mapping",
+            id_column="cid",
+            path_column="dir_path",
+        )
+        c.upsert("/a/b", "123")
+        assert c.get("/a/b") == "123"
+        assert c.invalidate("/a/b") is True
+
+
+def test_legacy_table_with_dir_path_column_compat():
+    """模拟老 cid_db_115.py 已建好的表（列名 dir_path），新 PathIdCache 接入不报错。
+
+    模拟场景：
+    1. 旧版已写入 (旧)  schema  (dir_path, cid)
+    2. 新版 PathIdCache 用 path_column='dir_path' 接入
+    3. 新版的 get / upsert / invalidate 都能正确工作
+    """
+    with _IsolatedCache():
+        # 1. 模拟老 cid_db_115.py 建表（旧 schema）
+        import sqlite3 as sqlite3_mod
+        # 拿到底层 patched 连接
+        conn = sqlite3_mod.connect()
+        conn.execute("""
+                CREATE TABLE dir_cid_mapping (
+                    dir_path TEXT PRIMARY KEY,
+                    cid TEXT NOT NULL UNIQUE,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        conn.execute(
+            "INSERT INTO dir_cid_mapping (dir_path, cid) VALUES (?, ?)",
+            ("/legacy/old", "99999"),
+        )
+        conn.commit()
+
+        # 2. 新版 PathIdCache 用 path_column="dir_path" 接入
+        c = PathIdCache(
+            table_name="dir_cid_mapping",
+            id_column="cid",
+            path_column="dir_path",
+        )
+
+        # 3. 验证能读出老数据、能写入新数据、能 invalidate
+        assert c.get("/legacy/old") == "99999", "应能读出老数据"
+        c.upsert("/legacy/new", "88888")
+        assert c.get("/legacy/new") == "88888"
+        c.invalidate("/legacy/old")
+        assert c.get("/legacy/old") is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 调试 / 测试用：count / clear
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,6 +296,8 @@ def run_all():
         ("标识符以数字开头拒绝", test_table_name_starting_with_digit_rejected),
         ("重复 table_name 拒绝", test_duplicate_table_name_rejected),
         ("不同 table_name 共存", test_different_table_names_can_coexist),
+        ("path_column 参数化", test_path_column_parameterized),
+        ("老表 dir_path 列兼容", test_legacy_table_with_dir_path_column_compat),
         ("count / clear", test_count_and_clear),
     ]
 
