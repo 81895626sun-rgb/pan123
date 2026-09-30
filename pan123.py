@@ -12,8 +12,6 @@ import logging
 from requests.exceptions import RequestException
 import random
 from typing import Tuple
-from cid_db_115 import upsert_mapping ,get_cid
-import sqlite3
 
 
 def normalize_drive_letter(path):
@@ -71,177 +69,12 @@ def convert_to_cloud_path(local_root, cloud_prefix, local_full_path):
     # 组合网盘路径
     return posixpath.join(cloud_prefix, relative_posix)
 
-#115专用函数find_cid_by_paths
-def find_cid_by_parts(client, parts: list) -> Tuple[int, list]:
-    """
-    根据路径的各个部分查找并返回对应的 current_id 和剩余 parts，支持分页查询和失败重试
-    
-    Args:
-        client: 客户端对象
-        parts: 目录分割后的列表 (e.g. ["folder1", "folder2"])
-    
-    Returns:
-        tuple: (current_id, remaining_parts)
-            current_id: 最后成功找到的目录ID (0表示根目录)
-            remaining_parts: 剩余未找到的部分列表 (空列表表示全部找到)
-    """
-    if not parts:
-        return 0, []  # 根目录，无需继续查找
-    
-    # 1. 先尝试从数据库查询完整路径
-    full_path = "/" + "/".join(parts)  # 拼接完整路径
-    try:
-        db_cid = get_cid(full_path)
-        if db_cid and db_cid != 0:
-            logging.info(f"从数据库找到缓存记录: {full_path} -> {db_cid}")
-            return int(db_cid), []  # 数据库中找到完整记录
-    except sqlite3.Error as e:
-        logging.warning(f"数据库查询失败（继续API查询）: {e}")
-
-
-    current_id = 0  # 从根目录开始
-    remaining_parts = parts.copy()  # 避免修改原始列表
-    max_retries = 3  # +++ 固定最大重试次数为 3
-    
-    while remaining_parts:
-        current_part = remaining_parts[0]
-        found = False
-        offset = 0  # 分页起始索引
-        
-        # 分页查询，直到找到目标或遍历完所有数据
-        while True:
-            payload = {
-                "cid": current_id,
-                "limit": 28,
-                "offset": offset,
-                "o": "user_ptime",
-                "asc": 0
-            }
-            
-            # +++ 带重试的请求逻辑
-            retry_count = 0
-            response = None
-            
-            while retry_count < max_retries:
-                try:
-                    response = client.fs_files(payload)
-
-                    time.sleep(random.uniform(1, 3))  # 随机延迟 1~3 秒
-                    if isinstance(response, dict) and response.get("state") is True and response.get("errNo") == 0:  # 请求成功则退出重试循环
-                        break
-                    else:
-                        logging.error(f"失败返回的response为{response}")
-                        error_msg = response.get("error", "Unknown error") if isinstance(response, dict) else "Unknown error"
-                        errNo = response.get("errNo", "Unknown") if isinstance(response, dict) else "Unknown"
-                        logging.error(f"请求失败（{retry_count + 1}/{max_retries}），错误码：{errNo}，错误信息：{error_msg}")
-                        raise RequestException(f"API Error: {error_msg}")  # 触发重试
-
-                except RequestException as e:
-                    logging.error(f"请求异常（{retry_count + 1}/{max_retries}），错误：{e}")
-                    time.sleep(random.uniform(1, 3))  # 随机延迟 1~3 秒
-                    retry_count += 1
-            
-            # 如果仍然失败或无数据，终止当前层查询
-            # 最终检查是否成功
-            if retry_count >= max_retries and (response is None or not isinstance(response, dict) or not response.get("state") or response.get("errNo") != 0):
-                err_no = response.get('errNo', 'Unknown') if isinstance(response, dict) else 'Unknown'
-                logging.error(f"重试 {max_retries} 次后仍失败，最终错误码：{err_no}")
-                break  # 终止当前层查询，返回 remaining → 上层退避重试（不再崩溃）
-            else:
-                logging.info("请求成功！")
-
-            # 遍历查询结果（response 已确认有效；get('data', []) 双保险防缺字段）
-            for item in response.get('data', []):
-                if isinstance(item, dict) and item['n'] == current_part:
-                    current_id = item['cid']
-                    remaining_parts.pop(0)  # 移除已找到的部分
-                    found = True
-                    # 3. 将找到的部分路径存入数据库
-                    partial_path = "/" + "/".join(parts[:len(parts)-len(remaining_parts)])
-                    try:
-                        upsert_mapping(partial_path, current_id)
-                        logging.info(f"新增数据库记录: {partial_path} -> {current_id}")
-                    except sqlite3.Error as e:
-                        logging.warning(f"缓存写入失败: {e}")
-                    break
-
-            
-            if found or len(response.get('data', [])) < 28:
-                break  # 找到目标或已查完所有数据
-            
-            offset += 28  # 继续查询下一页
-            time.sleep(0.5)  # 避免请求过快
-        
-        if not found:
-            break  # 当前部分未找到，停止查找
-    
-    return current_id, remaining_parts
-
-
-#123盘专用的
-def find_directory_path(client, parts):
-    current_id = "0"
-    
-    for i, part in enumerate(parts):
-        found = False
-        page = 1  # 页码从1开始
-        
-        while True:
-            # 构建payload字典
-            payload = {
-                "parentFileId": current_id,
-                "driveId": "0",
-                "limit": "100",
-                "Page": str(page),  # 添加页码参数
-                "orderBy": "file_id",
-                "orderDirection": "desc",
-                "event": "homeListFile",
-                "inDirectSpace": "false",
-                "trashed": "false"
-            }
-            
-            try:
-                # 123 上游 9/7 前后要求参数名严格驼峰。p123client.fs_list_new
-                # 内部 dict_key_to_lower_merge 把驼峰键打成小写，导致服务端返回
-                # code:400 "driveId is required"、data 为 null，触发崩溃。
-                # 绕过 fs_list_new，直接 client.request 透传 payload 中的驼峰键。
-                response = client.request(
-                    "file/list/new",
-                    params=payload,
-                    base_url="https://123pan.com",
-                )
-                if response.get("code") != 0:
-                    logging.error(
-                        f"列目录失败: code={response.get('code')} "
-                        f"msg={response.get('message')!r}"
-                    )
-                    break
-                # 防御 data 显式为 null：.get('data', {}) 在键存在但值为 None
-                # 时仍返回 None，下一行 None.get 会 AttributeError
-                data = response.get('data') or {}
-
-                # 在当前页数据中查找目标目录
-                for item in data.get('InfoList', []):
-                    if str(item.get('Type')) == '1' and item.get('FileName') == part:
-                        current_id = str(item['FileId'])
-                        found = True
-                        break
-                        
-                # 判断是否终止循环
-                if found or data.get('Next') == '-1':
-                    break
-                    
-                # 还有下一页，页码加1
-                page += 1
-                
-            except Exception as e:
-                logging.error(f"查询失败: {e}")
-                break
-                
-        if not found:
-            return current_id, parts[i:]
-            
-    return current_id, []
+# ──────────────────────────────────────────────────────────────────
+# find_cid_by_parts / find_directory_path 已迁移到 providers/pan115.py
+# 与 providers/pan123.py（带 path→id 缓存 + 懒失效策略）。
+# 旧位置: pan123.find_directory_path / find_cid_by_parts
+# 迁移原因: 见 2026-09-30 计划 "feat/cid-cache" 分支
+# ──────────────────────────────────────────────────────────────────
 
 
 def calculate_md5(file_path: str) -> str:

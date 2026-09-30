@@ -59,48 +59,51 @@ def test_cross_thread_sqlite_does_not_crash():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bug #2: find_cid_by_parts 重试耗尽后空响应崩溃
-# pan123.py:152  for item in response['data']:
-# 重试 3 次后 response 可能为 None 或缺少 data 字段，直接崩溃
+# Bug #2: 115 walk 重试耗尽后空响应崩溃
+# 原 pan123.py:152  for item in response['data']:
+# 重试 3 次后 response 可能为 None 或缺少 data 字段，直接崩溃。
+# 2026-09-30 改造后：原 find_cid_by_parts 逻辑迁移到
+# providers/pan115.py::Pan115Provider._walk_one_level，
+# 行为契约保持不变：fs_files 返回 None / 缺 data → 返回 (False, None)，
+# 由上层 resolve_path 转译为 (current_id, remaining) 让 worker 退避重试。
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_find_cid_by_parts_empty_response_no_crash():
-    """Bug #2 修复验证：fs_files 返回 None 不崩溃，返回 remaining 走退避重试。
+def test_walk_one_level_empty_response_no_crash():
+    """Bug #2 修复验证（2026-09-30 改造后）：_walk_one_level 收到 None response 不崩溃。
 
     修复前：response.get() 在 None 上 AttributeError / response['data'] TypeError。
-    修复后：干净返回 (current_id, 非空 remaining) → 上层退避重试。
+    修复后：干净返回 (False, None) → resolve_path 上层翻译为 (current_id, remaining)，
+    worker 走退避重试。
     """
-    # 模拟 client.fs_files 始终返回 None
     mock_client = MagicMock()
-    mock_client.fs_files.return_value = None
+    mock_client.fs_files.return_value = None  # 重试 3 次后仍 None
 
-    from pan123 import find_cid_by_parts
+    from providers.pan115 import Pan115Provider
 
-    current_id, remaining = find_cid_by_parts(mock_client, ["folder1", "folder2"])
+    p = Pan115Provider(mock_client)
+    found, cid = p._walk_one_level("0", "folder1")
 
-    assert remaining == ["folder1", "folder2"], (
-        f"修复后应返回全部 remaining（父目录未找到，走退避重试），实际: {remaining}"
-    )
-    assert not isinstance(current_id, type(None)) or current_id == 0, "current_id 应为 0（根目录）"
+    assert found is False, "None response 应判为 not found"
+    assert cid is None, "None response 不应返回任何 cid"
 
 
-def test_find_cid_by_parts_missing_data_key_no_crash():
-    """Bug #2 修复验证：response 缺 data 字段不崩溃，返回 remaining。
+def test_walk_one_level_missing_data_key_no_crash():
+    """Bug #2 修复验证（2026-09-30 改造后）：response 缺 data 字段不崩溃。
 
     修复前：response['data'] KeyError。
-    修复后：get('data', []) 空列表，未找到 → 返回 remaining。
+    修复后：get('data', []) 空列表，未找到 → 返回 (False, None)。
     """
     mock_client = MagicMock()
     response = {"state": True, "errNo": 0}  # 成功标志但没有 "data" 字段
     mock_client.fs_files.return_value = response
 
-    from pan123 import find_cid_by_parts
+    from providers.pan115 import Pan115Provider
 
-    current_id, remaining = find_cid_by_parts(mock_client, ["folder1"])
+    p = Pan115Provider(mock_client)
+    found, cid = p._walk_one_level("0", "folder1")
 
-    assert remaining == ["folder1"], (
-        f"响应缺 data 字段时不应崩溃，应返回 remaining 走退避重试，实际: {remaining}"
-    )
+    assert found is False, "缺 data 字段应判为 not found"
+    assert cid is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -351,9 +354,9 @@ def run_all():
     tests = [
         # Bug #1: 跨线程 SQLite（已修复）
         ("Bug#1 跨线程SQLite不崩溃", test_cross_thread_sqlite_does_not_crash),
-        # Bug #2: find_cid_by_parts 空响应（已修复）
-        ("Bug#2 空响应不崩溃", test_find_cid_by_parts_empty_response_no_crash),
-        ("Bug#2 缺data字段不崩溃", test_find_cid_by_parts_missing_data_key_no_crash),
+        # Bug #2: 115 walk 空响应（2026-09-30 改造后位置迁到 providers.pan115._walk_one_level）
+        ("Bug#2 空响应不崩溃", test_walk_one_level_empty_response_no_crash),
+        ("Bug#2 缺data字段不崩溃", test_walk_one_level_missing_data_key_no_crash),
         # Bug #4: import 时 monkey-patch
         ("Bug#4 monkey-patch已应用", test_monkey_patch_is_applied),
         ("Bug#4 appversion注入", test_monkey_patch_injects_appversion),

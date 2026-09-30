@@ -304,6 +304,111 @@ data = response.get('data') or {}
 - `data = response.get('data', {})` 务必加 `or {}` 防 `data:null`，并校验 `code != 0` 显式 break，避免把"参数错误"变成静默的"任务放弃"。
 - 库升级到 `p123client==0.0.9.4` **不会修这个**（`fs_list_new` 实现没变，`dict_key_to_lower_merge` 仍把所有键小写化）。依赖升级不是这个问题的解法。
 
+---
+
+## 10. 通用 path→id 缓存（feat/cid-cache 分支实施）
+
+> **状态：已实施。** 2026-09-30 架构层落地（替代 v1 复制粘贴 `cid_db_115.py` 的方案）。
+> 影响面：`providers/base.py`（加 `resolve_path` 抽象）+ `providers/_cid_cache.py`（新增通用缓存）+ `providers/pan123.py` / `providers/pan115.py`（实现）+ `pan123.py`（删除原 `find_directory_path` / `find_cid_by_parts`）+ `monitor.py`（调用方 rename）。
+
+### 10.1 为什么需要
+
+9/7 修复后（见 ## 9），123 的 `find_directory_path` 每次上传都重走 API 列目录：6 段路径 = 6 次 `file/list/new`。同一剧集下的多个文件，**每一层都重复列一次**——热门剧目一天几十次上传，徒增 API 压力。
+
+更糟的是**单线程 worker + 无 max-page 兜底**：18:20–22:46 曾因 123 `Next` 字段异常把整个 worker 卡死 4 小时，饿死几十个文件。加缓存后热路径零 API 调用，扫页 bug 的"土壤"基本消除。
+
+### 10.2 架构改进（v2 替代 v1）
+
+**v1 计划（不采用）**：复制 `cid_db_115.py` 改名为 `cid_db_123.py`。问题：
+1. 复制粘贴——违反 DRY
+2. 缓存在仓库根，与 `providers/` 抽象脱节——加新 provider 又要复制一份
+3. `find_directory_path` 混合路径拼装 + 缓存 + API + 写入四种关注点
+4. 路径格式 `"/" + "/".join(parts)` 是隐式契约
+
+**v2（已实施）**：通用 `PathIdCache` + provider 自管的 `resolve_path`。
+
+```
+providers/
+  base.py             # CloudProvider ABC：加 resolve_path 抽象方法
+  _cid_cache.py       # 新建：通用 PathIdCache（单例连接 + RLock + 参数化表/列）
+  pan123.py           # 实现 resolve_path + _walk_one_level（123 翻页逻辑）+ _maybe_invalidate_parent
+  pan115.py           # 实现 resolve_path + _walk_one_level（115 翻页逻辑）+ _maybe_invalidate_parent
+pan123.py             # 删除 find_directory_path / find_cid_by_parts（原逻辑整体迁移）
+monitor.py            # provider.find_parent → provider.resolve_path（语义不变）
+```
+
+**核心契约**：
+```python
+@abstractmethod
+def resolve_path(self, parts: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """返回 (parent_id, remaining_parts)。
+    - 先查缓存最大前缀，命中跳过 API
+    - 未命中段逐层走 API（带分页/重试）
+    - 每找到一个 segment 就 upsert 到缓存
+    - API 找不到 → invalidate 缓存里对应的 parent 条目
+    - remaining=() 表示完整解析；非空表示上层需退避重试
+    """
+```
+
+### 10.3 缓存失效策略（懒失效）
+
+| 触发条件 | 行为 |
+|---|---|
+| API 在缓存命中的 parent 下找不到目标段 | invalidate parent 这条缓存 |
+| API 返回 `code != 0` / 瞬时 5xx | **不**invalidate（避免瞬时错误清缓存） |
+| invalidate 不存在的 path | 返回 False，**不抛异常**（幂等） |
+| SQLite 异常（写不进去等） | log WARNING，**不**让上传流程中断 |
+
+**为什么只 invalidate parent 不级联**：parent 是缓存命中过的（可能脏），segment 是 cache miss（没存过、删了 0 行）。级联清是"过度修复"——下次 resolve 时缓存命中就跳过 API，根本不会被脏数据坑。极端场景下"深层失效"靠自然冒泡：parent 真被删了，下次 resolve 仍 miss → API 仍找不到 → 再 invalidate parent（DELETE 0 行无害）。
+
+**为什么不用 TTL**：123 / 115 目录结构相对稳定；懒失效已覆盖"用户删目录"主场景。TTL 引入复杂度收益不大。
+
+### 10.4 路径格式契约
+
+`providers/_cid_cache.py::format_path_key(parts)` 提供：
+```python
+return "/" + "/".join(parts)
+```
+
+所有 `PathIdCache.get` / `upsert` / `invalidate` 的 path 参数都通过这个函数构造，**不允许调用方自己拼字符串**。统一格式后不同 provider 的缓存 key 不会出现"形似实异"的脏数据。
+
+### 10.5 安全设计
+
+- **SQL 标识符白名单**：`PathIdCache.__init__` 用 `_check_ident` 校验 `table_name` / `id_column` 必须是 `[A-Za-z_][A-Za-z0-9_]*`，禁止特殊字符（防 SQL 注入和拼写错误）。
+- **同一 table_name 不能创建两个实例**（防覆盖）。
+- **所有 SQLite 操作包在 `with self._lock:`** 内（上传是单线程，锁开销可忽略）。
+- **get / upsert / invalidate 失败均 log 后吞掉**，不让上传流程崩——缓存是优化不是真理，下次 resolve 会再 walk 一次重建。
+
+### 10.6 验证
+
+`D:\code\_archive\linshi\yunwei\verify_cid_cache.py`（只读脚本，不传文件、不动仓库）：
+- **Phase 1 冷启动 walk**：6 段路径 → 6 次 API（与原 verify_after_patch.py 一致，证明 walk 逻辑等价）
+- **Phase 2 暖启动 resolve**：同一路径再 resolve → **0 次 API 调用**（缓存全命中）
+- **Phase 3 懒失效契约**：invalidate `/nas/MPLink/teleplay` → 再 resolve → 4 次 API（前 2 段命中、后 4 段 walk）
+- **Phase 4 重填后再 0 API**：Phase 3 重 walk 后再 resolve → 又 0 次 API
+
+单元测试（`tests/test_cid_cache.py` 16 项 + `tests/test_provider.py` 23 项）覆盖 get / upsert / invalidate / SQL 注入防御 / 标识符白名单 / 双实例隔离 / resolve_path 全场景 mock。
+
+### 10.7 实施后调用方无感知
+
+`monitor.py` 只改了 2 行：`provider.find_parent(parts)` → `provider.resolve_path(tuple(parts))`。返回结构从 `(parent_id, remaining)` 同样变成 `(parent_id, remaining)`（remaining 类型从 list 变 tuple，鸭子类型兼容）。
+
+`upload_worker.py` / `handle_dir_creation` / `handle_file_creation` 均无修改——它们通过 `provider` 接口访问，不知道也不关心具体实现。
+
+### 10.8 显式不做（标记为后续）
+
+- **异步缓存写入**：本次同步写入，单线程 worker 单次 walk ~6ms 开销可忽略；接口设计已留好替换空间（只换 `PathIdCache` 内部实现，不动抽象）。
+- **TTL 失效**：懒失效覆盖主场景。
+- **异步 I/O 改造 worker**：独立大重构，不在本次范围。
+- **max-page 兜底**：等观察 1-2 周决定，cache 上完后翻页 bug 土壤基本消除。
+
+### 10.9 再犯排查
+
+- 新增网盘 provider → 写一个 `PathIdCache(table_name=..., id_column=...)` 单例 + 实现 `resolve_path` / `_walk_one_level` / `_maybe_invalidate_parent` 即可，无需关心缓存实现细节。
+- 缓存表丢了 / 想重建 → 直接删 `cid_mapping.db`，下次 resolve 会自动重建表 + 填充。
+- 缓存错乱（parent FileId 错了）→ 不必手动 SQL 修，让 lazy invalidation 自然修复：用户上传一个文件 → resolve 不到 → invalidate parent → 重 walk 填正确值。
+- 想要"重启清缓存" → 删 `cid_mapping.db` + 重启容器（不推荐，会触发冷启动全 walk）。
+
 ## 通用排查思路
 
 1. **先看 `error.log`（ERROR+）和 `upload.log`**，按 ERROR 消息前缀分类：`查询失败` / `请求失败` / `【彻底放弃上传】` / `[任务放弃]`。

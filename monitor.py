@@ -209,7 +209,7 @@ def handle_file_creation(provider, monitor, file, task=None):
         local_full_path=file
     )
     parts = [p for p in cloud_full_path.split('/') if p][:-1]
-    dir_id, remaining = provider.find_parent(parts)
+    dir_id, remaining = provider.resolve_path(tuple(parts))
     found = not remaining
 
     if found:
@@ -269,7 +269,7 @@ def handle_dir_creation(providers, monitor, file):
 
     for provider in providers.values():
         try:
-            parent_id, remaining = provider.find_parent(parts)
+            parent_id, remaining = provider.resolve_path(tuple(parts))
             if remaining:
                 logging.error(f"{provider.name}网盘找不到父目录，跳过建文件夹: {file}，缺失段: {remaining}")
             else:
