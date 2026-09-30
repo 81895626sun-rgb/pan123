@@ -18,15 +18,22 @@ class CloudProvider(ABC):
         self.client = client  # 对应网盘的 SDK client 实例
 
     @abstractmethod
-    def find_parent(self, parts: list) -> tuple:
-        """根据路径段列表查找父目录 ID。
+    def resolve_path(self, parts: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+        """根据路径段解析为 (parent_id, remaining_parts)。
+
+        实现规约：
+        - 先查本地缓存（最大前缀匹配），命中即跳过 API
+        - 未命中段逐层走 API（带分页）
+        - 每找到一个 segment 就 upsert 到缓存
+        - API 返回 404 / 列表中无匹配项时 invalidate 缓存中对应段的条目
+        - parent_id 是 str 类型（123 用 FileId 字符串，115 用 cid 字符串）
+        - remaining_parts=() 表示完全解析；非空表示未就绪，上层应退避重试
 
         Args:
-            parts: 云端路径段列表，如 ["folder1", "folder2"]
+            parts: 云端路径段元组，如 ("folder1", "folder2")
 
         Returns:
-            (parent_id, remaining_parts): parent_id 是最后找到的目录 ID，
-            remaining_parts 是未找到的剩余段（空列表表示全部找到）。
+            (parent_id, remaining_parts)
         """
         ...
 
