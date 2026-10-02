@@ -17,45 +17,46 @@ from queue import Queue
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bug #1: 跨线程 SQLite (cid_db_115.py)
-# sqlite3.connect("cid_mapping.db") 默认 check_same_thread=True，
-# 但连接被 priority_queue_worker 线程调用 find_cid_by_parts 使用。
-# 触发条件：主线程创建连接 → 另一个线程执行查询
+# Bug #1: 跨线程 SQLite
+# 原触发点：cid_db_115.py 模块级 sqlite3.connect 默认 check_same_thread=True，
+# 连接被 priority_queue_worker 线程调用 find_cid_by_parts 使用时抛 ProgrammingError。
+# 2026-10-02 起 cid_db_115.py 已删除（死代码），缓存统一走 providers/_cid_cache.py，
+# 本测试直接验证 PathIdCache 的跨线程行为。
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_cross_thread_sqlite_does_not_crash():
-    """Bug #1 修复验证：cid_db_115 连接 check_same_thread=False，跨线程读写不崩。
+    """Bug #1 修复验证：PathIdCache 连接 check_same_thread=False + RLock，跨线程读写不崩。
 
     修复前：模块级连接默认 check_same_thread=True，主线程创建后被 worker 线程
     使用会抛 ProgrammingError。
     修复后：check_same_thread=False + RLock 串行化，跨线程安全。
     """
-    import cid_db_115
+    from providers._cid_cache import PathIdCache
+    from test_cid_cache import _IsolatedCache
 
-    # 修复后连接用 check_same_thread=False（源码层面），
-    # 这里直接验证核心行为：多线程并发 upsert + get 不应抛 ProgrammingError
-    cid_db_115.get_connection()
+    with _IsolatedCache():
+        c = PathIdCache(table_name="cross_thread_test", id_column="xid")
 
-    errors = []
-    results = []
+        errors = []
+        results = []
 
-    def worker(i):
-        try:
-            cid_db_115.upsert_mapping(f"/thread/{i}", str(i))
-            got = cid_db_115.get_cid(f"/thread/{i}")
-            results.append((i, got))
-        except Exception as e:
-            errors.append((i, type(e).__name__, str(e)))
+        def worker(i):
+            try:
+                c.upsert(f"/thread/{i}", str(i))
+                got = c.get(f"/thread/{i}")
+                results.append((i, got))
+            except Exception as e:
+                errors.append((i, type(e).__name__, str(e)))
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    assert not errors, f"跨线程 SQLite 操作不应崩溃: {errors[:3]}"
-    for i, got in results:
-        assert got == str(i), f"线程 {i} 写入/读取不一致: {got}"
+        assert not errors, f"跨线程 SQLite 操作不应崩溃: {errors[:3]}"
+        for i, got in results:
+            assert got == str(i), f"线程 {i} 写入/读取不一致: {got}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -161,24 +162,48 @@ def test_monkey_patch_injects_appversion():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bug #5: failed_tasks.txt 在 Docker 未挂载
-# upload_worker.py: FAILED_TASKS_FILE = "failed_tasks.txt"（相对路径 = cwd）
-# docker-compose.yml 未 bind-mount 此文件，容器重启后丢失
+# Bug #5: failed_tasks.txt 持久化
+# 原问题：FAILED_TASKS_FILE 固定相对路径写 cwd，部署未 bind-mount 时容器重启丢失。
+# 2026-10-02 修复：路径支持 FAILED_TASKS_FILE 环境变量覆盖（写入时读取），
+# 默认仍为 cwd/failed_tasks.txt（repo 的 docker-compose.yml 已 bind-mount 该文件；
+# NAS 等自定义部署需自行加挂载或设环境变量指向持久目录）。
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_failed_tasks_file_is_relative_path():
-    """Bug #5: failed_tasks.txt 使用相对路径，Docker 重启后丢失。
+def test_failed_tasks_path_default_is_cwd_relative():
+    """Bug #5 修复验证：未配置环境变量时默认 cwd 下 failed_tasks.txt（容器内 /app）。"""
+    from upload_worker import _failed_tasks_path, FAILED_TASKS_FILE
 
-    当前行为：文件写入 cwd，Docker 未挂载则丢失。
-    """
-    from upload_worker import FAILED_TASKS_FILE
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FAILED_TASKS_FILE", None)
+        path = _failed_tasks_path()
 
-    # 验证是相对路径（不是绝对路径）
-    assert not os.path.isabs(FAILED_TASKS_FILE), (
-        f"预期 FAILED_TASKS_FILE 为相对路径（当前：{FAILED_TASKS_FILE}），"
-        "Docker 未挂载时容器重启会丢失"
-    )
-    assert FAILED_TASKS_FILE == "failed_tasks.txt"
+    assert path == FAILED_TASKS_FILE == "failed_tasks.txt"
+    assert not os.path.isabs(path), f"默认应为相对路径（当前：{path}）"
+
+
+def test_failed_tasks_path_env_override_persists_outside_container():
+    """Bug #5 修复验证：FAILED_TASKS_FILE 环境变量可指向挂载的持久目录，
+    log_failed_task 实际落盘到该绝对路径。"""
+    from upload_worker import _failed_tasks_path, log_failed_task
+    from monitor import UploadTask
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target = os.path.join(tmpdir, "failed_tasks.txt")
+        with patch.dict(os.environ, {"FAILED_TASKS_FILE": target}):
+            assert _failed_tasks_path() == target
+
+            task = UploadTask(local_path="/tmp/test.txt", is_dir=False, pan_name="123")
+            task.retries = 3
+            task.dir_id = "12345"
+            try:
+                log_failed_task(task, "测试错误")
+            except Exception:
+                pass  # Telegram 通知失败不影响文件写入
+
+        # 在 TemporaryDirectory 内断言（退出上下文会清理临时目录）
+        assert os.path.exists(target), (
+            f"失败清单应写入环境变量指定的持久路径 {target}，容器重启后随挂载目录保留"
+        )
 
 
 def test_failed_tasks_writes_to_cwd():
@@ -352,7 +377,7 @@ def test_upload_failure_retry_keeps_count_balanced():
 
 def run_all():
     tests = [
-        # Bug #1: 跨线程 SQLite（已修复）
+        # Bug #1: 跨线程 SQLite（已修复；2026-10-02 起验证对象为 PathIdCache）
         ("Bug#1 跨线程SQLite不崩溃", test_cross_thread_sqlite_does_not_crash),
         # Bug #2: 115 walk 空响应（2026-09-30 改造后位置迁到 providers.pan115._walk_one_level）
         ("Bug#2 空响应不崩溃", test_walk_one_level_empty_response_no_crash),
@@ -360,9 +385,10 @@ def run_all():
         # Bug #4: import 时 monkey-patch
         ("Bug#4 monkey-patch已应用", test_monkey_patch_is_applied),
         ("Bug#4 appversion注入", test_monkey_patch_injects_appversion),
-        # Bug #5: failed_tasks.txt 未挂载
-        ("Bug#5 相对路径", test_failed_tasks_file_is_relative_path),
-        ("Bug#5 写入cwd", test_failed_tasks_writes_to_cwd),
+        # Bug #5: failed_tasks.txt 持久化（2026-10-02 修复：环境变量可配置）
+        ("Bug#5 默认cwd相对路径", test_failed_tasks_path_default_is_cwd_relative),
+        ("Bug#5 环境变量覆盖持久化", test_failed_tasks_path_env_override_persists_outside_container),
+        ("Bug#5 默认写入cwd", test_failed_tasks_writes_to_cwd),
         # Bug #6: GROWING 退避不再阻塞（已修复）
         ("Bug#6 不阻塞就绪文件", test_growing_available_after_does_not_block_ready),
         ("Bug#6 退避未到期不入队上传", test_growing_backoff_respects_available_after),

@@ -232,7 +232,7 @@ def handle_upload_failure(upload_queue, task, error_msg=None, on_final_failure=N
 - **B（先做，零风险）**：补全 115 异常的完整 traceback。现在 `upload_worker.py` 只记 `__cause__` 的 `[:300]` 字符串，看不到 p115oss 哪一行炸的。改成 `logging.error(..., exc_info=True)` 或 `traceback.format_exc()`，跑一两天确认 IndexError 真身（是不是 401 化身）+ 定位 p115oss 出错行。
 - **C（后做，据 B 的数据）**：定位到 p115oss 0.1.0.3 的 bug 后，二选一 -- ① 像 `upload_init` 那样 monkeypatch（见 #2）；② 评估升级 p115oss/p115client（但要重新验证 `upload_init`/`upload_file` 签名，#2/#4/#5 都被升级坑过）。
 - **401 侧**：不可自愈，只能加可观测性 -- 连续 N 次 401 就发明确告警「115 cookie 可能失效，需手动刷新」，甚至快速失败不浪费重试。属独立小改进。
-- **D/E（可选）**：READY 态失败加指数退避 + 适度提 `MAX_RETRIES`（对 IndexError 瞬时有用，对持续 401 无用）；`failed_tasks.txt` 挂出宿主机（目前容器内写、没 bind-mount，排查拿不到）。
+- **D/E（可选）**：READY 态失败加指数退避 + 适度提 `MAX_RETRIES`（对 IndexError 瞬时有用，对持续 401 无用）；`failed_tasks.txt` 挂出宿主机（2026-10-02 已修：repo compose 已 bind-mount，且路径支持 `FAILED_TASKS_FILE` 环境变量覆盖指向持久目录；NAS 等自定义部署需自行加挂载）。
 
 **再犯排查**
 - 115 上传报 401/IndexError -> 先看是不是偶发（重试能过就是瞬时网络/token）；连续失败才怀疑 cookie。
@@ -309,6 +309,8 @@ data = response.get('data') or {}
 ## 10. 通用 path→id 缓存（feat/cid-cache 分支实施）
 
 > **状态：已实施。** 2026-09-30 架构层落地（替代 v1 复制粘贴 `cid_db_115.py` 的方案）。
+> 2026-10-02 收尾：`cid_db_115.py` 死代码已删除（生产代码自 v2 起不再引用，仅测试残留），
+> Bug#1 跨线程测试同步迁移到 `PathIdCache`。115 老表 `dir_cid_mapping`（`dir_path` 列）数据不变，仍由 `PathIdCache(path_column="dir_path")` 兼容读写。
 > 影响面：`providers/base.py`（加 `resolve_path` 抽象）+ `providers/_cid_cache.py`（新增通用缓存）+ `providers/pan123.py` / `providers/pan115.py`（实现）+ `pan123.py`（删除原 `find_directory_path` / `find_cid_by_parts`）+ `monitor.py`（调用方 rename）。
 
 ### 10.1 为什么需要
@@ -408,6 +410,15 @@ return "/" + "/".join(parts)
 - 缓存表丢了 / 想重建 → 直接删 `cid_mapping.db`，下次 resolve 会自动重建表 + 填充。
 - 缓存错乱（parent FileId 错了）→ 不必手动 SQL 修，让 lazy invalidation 自然修复：用户上传一个文件 → resolve 不到 → invalidate parent → 重 walk 填正确值。
 - 想要"重启清缓存" → 删 `cid_mapping.db` + 重启容器（不推荐，会触发冷启动全 walk）。
+
+## 11. 技术债清理（2026-10-02）
+
+> **状态：已实施。** 架构优化（## 10）后的收尾清理，四项一次性落地。
+
+1. **删除 `cid_db_115.py` 死代码**：生产代码自 v2 起不再 import（仅 `tests/test_latent_bugs.py` Bug#1 残留引用），Bug#1 跨线程测试迁移到 `PathIdCache`。115 老表数据不受影响（`dir_cid_mapping` + `dir_path` 列由 `PathIdCache(path_column="dir_path")` 继续读写）。
+2. **Bug#5 修复——`failed_tasks.txt` 可配置**：`upload_worker.py::_failed_tasks_path()` 每次写入时读 `FAILED_TASKS_FILE` 环境变量，未配置默认 `cwd/failed_tasks.txt`（容器内 /app，repo compose 已 bind-mount）。NAS 等自定义部署：加 `-v ./failed_tasks.txt:/app/failed_tasks.txt` 挂载，或设 `FAILED_TASKS_FILE` 指向已挂载目录。注意 bind-mount 单文件需宿主先 `touch` 该文件，否则 Docker 会创建成目录。
+3. **Bug#4 防护——p115oss monkey-patch 显式化**：`client.py` 的 `upload_init` 补丁应用改为 try/except + 启动日志（"已启用 p115oss upload_init 补丁…"）。升级 p115oss 后若 115 上传异常，启动日志可第一时间定位嫌疑，不再静默。
+4. **空闲心跳去噪**：`upload_worker.py` 的 "✅ 所有上传任务已完成" 从每 30s 重复打改为每个空闲期只打一次（`idle_logged` 标志，取到新任务时重置）。长时间空闲下 upload.log 不再被刷屏。
 
 ## 通用排查思路
 

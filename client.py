@@ -50,6 +50,8 @@ class P123ClientFixed(P123Client):
 # (upload_file 构造的 payload 里没 appversion), 115 上传必崩 (被包装成 MultipartUploadAbort)。
 # 修正: 调用前注入真实 appversion "36.2.28"。
 # 注意: 不能用 p115oss 0.1.0.2 —— 它用假 appversion "99.99.99.99", 会被 115 WAF 拦 405。
+# 2026-10-02: 补丁应用改为显式日志 + try/except 防护 —— p115oss 升级后若补丁失效/冲突，
+# 启动日志可第一时间发现，而不是到上传时才炸（见 troubleshooting.md Bug#4）。
 _orig_p115oss_upload_init = p115oss.upload.upload_init
 
 
@@ -59,7 +61,14 @@ def _p115oss_upload_init_fixed(payload, *, async_=False, **request_kwargs):
     return _orig_p115oss_upload_init(payload, async_=async_, **request_kwargs)
 
 
-p115oss.upload.upload_init = _p115oss_upload_init_fixed
+try:
+    p115oss.upload.upload_init = _p115oss_upload_init_fixed
+    logging.info(
+        "已启用 p115oss upload_init 补丁（注入 appversion=36.2.28，修复 0.1.0.3 的 KeyError）。"
+        "若升级 p115oss 后 115 上传异常，优先排查此补丁与新版本的兼容性。"
+    )
+except Exception as e:  # p115oss 内部结构变化时的兜底，不让 import 直接崩
+    logging.warning(f"p115oss upload_init 补丁应用失败（115 上传可能报 KeyError）: {e}")
 
 
 class CloudClientManager:

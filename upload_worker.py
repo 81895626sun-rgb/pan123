@@ -1,12 +1,19 @@
 from queue import  Empty
 import logging
 import json
+import os
 import time
 from datetime import datetime
 from file_checker import FileGrowthChecker, FileState  # 添加 FileState
 
 MAX_RETRIES = 3  # 最大重试次数
-FAILED_TASKS_FILE = "failed_tasks.txt"  # 失败任务记录文件
+FAILED_TASKS_FILE = "failed_tasks.txt"  # 失败任务记录文件默认名（cwd = 容器内 /app）
+
+
+def _failed_tasks_path() -> str:
+    """失败清单落盘路径：优先读 FAILED_TASKS_FILE 环境变量（可指向挂载的持久目录），
+    未配置时落到 cwd/failed_tasks.txt（容器内 /app，需 compose bind-mount 才能跨重启保留）。"""
+    return os.getenv("FAILED_TASKS_FILE") or FAILED_TASKS_FILE
 
 
 def log_failed_task(task, error_msg, notifier=None):
@@ -19,7 +26,7 @@ def log_failed_task(task, error_msg, notifier=None):
         "retries": task.retries,
         "error": error_msg
     }
-    with open(FAILED_TASKS_FILE, "a", encoding="utf-8") as f:
+    with open(_failed_tasks_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(task_data, ensure_ascii=False) + "\n")
 
     # 发送Telegram通知
@@ -74,12 +81,14 @@ def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=
     让 monitor 清 dispatched_tasks（见 troubleshooting.md #7）。
     notifier: TelegramNotifier 实例（可选），用于发送上传成功/失败通知。"""
     last_active_time = time.time()
+    idle_logged = False  # 本轮空闲期是否已打过「全部完成」日志（避免每 30s 刷屏）
     while True:
         try:
             empty_count = 0  # 重置计数器（每次成功获取任务后重置）
             # 1. 从队列获取任务（1秒超时避免永久阻塞）
             task = upload_queue.get(timeout=1)
             last_active_time = time.time()  # 重置活跃时间
+            idle_logged = False  # 有新任务：下一轮空闲期重新允许打一次
 
             # 1.5 GROWING 退避未到期：放回队尾让出线程（单线程穿插处理其他就绪文件），
             # 不放 sleep 阻塞。注意：必须在 check_growth 之前检查，避免白跑文件检测。
@@ -136,13 +145,13 @@ def upload_task_worker(providers, upload_queue, on_final_failure=None, notifier=
                 handle_upload_failure(upload_queue, task, "文件状态检测失败", on_final_failure=on_final_failure, notifier=notifier)
 
         except Empty:
-            # 4. 队列空时短暂等待（避免CPU空转）
-            # 新增队列空完成检测
+            # 4. 队列空：仅在「忙→闲」转换时打一条日志，之后保持安静直到新任务到来
+            #（原来每 30s 重复打一条，长时间空闲下日志被刷屏）
             if upload_queue.unfinished_tasks == 0:
                 idle_time = time.time() - last_active_time
-                if idle_time > 2:  # 持续空闲2秒才确认完成
+                if idle_time > 2 and not idle_logged:  # 持续空闲2秒才确认完成
                     logging.info("✅ 所有上传任务已完成（包括初始空队列）")
-                    time.sleep(30)  # 避免频繁提示
+                    idle_logged = True
             continue
 
         except Exception as e:
