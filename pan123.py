@@ -7,11 +7,20 @@ import os
 import re
 import requests
 from typing import Optional, Dict,  Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 import logging
 from requests.exceptions import RequestException
 import random
 from typing import Tuple
+
+
+DEFAULT_CHUNK_CONNECT_TIMEOUT = 10
+DEFAULT_CHUNK_READ_TIMEOUT = 300
+DEFAULT_BATCH_TIMEOUT = 600
 
 
 def normalize_drive_letter(path):
@@ -92,33 +101,48 @@ def calculate_md5(file_path: str) -> str:
 
     return hash_md5.hexdigest()
 
-def upload_chunk(args: Tuple[int, bytes, str, int]) -> Tuple[int, Optional[str]]:
-    """123盘优化内存的分块上传"""
+def upload_chunk(
+    args: Tuple[int, bytes, str, int],
+    connect_timeout: float = DEFAULT_CHUNK_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_CHUNK_READ_TIMEOUT,
+) -> Tuple[int, Optional[str]]:
+    """上传一个 123 分片，并在请求超时或其他异常时重试。"""
     part_num, chunk, current_url, max_retries = args
     chunk_size = len(chunk)
-    try:
-        # 立即释放内存
-        headers = {'Content-Length': str(chunk_size),'Content-Type': 'application/octet-stream'}
-        response = requests.put(
-            current_url,
-            data=chunk,
-            headers=headers
-        )
-        
-        del chunk  # 主动释放内存
-        
-        if response.status_code not in [200, 201]:
-            raise ValueError(f"状态码异常: {response.status_code}")
-        
-        etag = response.headers.get("ETag", "").strip('"')
-        if not etag:
-            raise ValueError("ETag缺失")
-        
-        logging.info(f"[成功] 分块 {part_num} (大小: {chunk_size/1024/1024:.1f}MB) etag的值为{etag}")
-        return part_num, etag
-    except Exception as e:
-        logging.warning(f"[分块失败] 序号 {part_num} 遇到网络波动或异常，稍后重试。详情: {str(e)[:100]}")
-        return part_num, None
+    headers = {
+        'Content-Length': str(chunk_size),
+        'Content-Type': 'application/octet-stream',
+    }
+    retry_limit = max(1, int(max_retries))
+
+    for attempt in range(1, retry_limit + 1):
+        try:
+            response = requests.put(
+                current_url,
+                data=chunk,
+                headers=headers,
+                timeout=(connect_timeout, read_timeout),
+            )
+
+            if response.status_code not in [200, 201]:
+                raise ValueError(f"状态码异常: {response.status_code}")
+
+            etag = response.headers.get("ETag", "").strip('"')
+            if not etag:
+                raise ValueError("ETag缺失")
+
+            logging.info(
+                f"[成功] 分块 {part_num} (大小: {chunk_size/1024/1024:.1f}MB) etag的值为{etag}"
+            )
+            return part_num, etag
+        except Exception as e:
+            logging.warning(
+                f"[分块失败] 序号 {part_num} 第 {attempt}/{retry_limit} 次尝试失败，"
+                f"稍后重试。详情: {str(e)[:100]}"
+            )
+
+    return part_num, None
+
 
 def process_upload_batch(
     client: P123Client,
@@ -126,15 +150,54 @@ def process_upload_batch(
     upload_data: Dict,
     parts_to_upload: Set[int],
     max_workers: int = 3,
-    slice_size: int = 134217728
+    slice_size: int = 134217728,
+    connect_timeout: float = DEFAULT_CHUNK_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_CHUNK_READ_TIMEOUT,
+    batch_timeout: float = DEFAULT_BATCH_TIMEOUT,
 ) -> Set[int]:
-    """严格控制内存的批量上传"""
+    """严格控制内存的批量上传，并对分片批次设置超时。"""
     failed_parts = set()
     uploaded_parts = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = []
+    future_parts = {}
+
+    def collect_futures(batch_futures):
+        processed = set()
+
+        def collect_one(future):
+            part_num = future_parts[future]
+            processed.add(future)
+            try:
+                part_num, etag = future.result()
+            except Exception as e:
+                logging.warning(
+                    f"[分块异常] 序号 {part_num} 上传任务异常，稍后重试。详情: {str(e)[:100]}"
+                )
+                failed_parts.add(part_num)
+                return
+            if etag:
+                uploaded_parts.append({"PartNumber": part_num, "ETag": etag})
+            else:
+                failed_parts.add(part_num)
+
+        try:
+            for future in as_completed(batch_futures, timeout=batch_timeout):
+                collect_one(future)
+        except FuturesTimeoutError:
+            logging.warning(
+                f"[分块超时] 批次在 {batch_timeout} 秒内未完成，未完成分片将重试"
+            )
+            for future in batch_futures:
+                if future in processed:
+                    continue
+                if future.done():
+                    collect_one(future)
+                else:
+                    future.cancel()
+                    failed_parts.add(future_parts[future])
+
+    try:
         for part_num in sorted(parts_to_upload):
             try:
                 # 获取上传URL
@@ -149,40 +212,39 @@ def process_upload_batch(
                 url = prepare_parts['data']['presignedUrls'].get(str(part_num))
                 if not url:
                     raise ValueError("URL缺失")
-                
+
                 # 分块读取（严格控制内存）
                 with open(file_path, "rb") as f:
                     f.seek((part_num - 1) * slice_size)
                     chunk = f.read(slice_size)
-                
+
                 # 提交任务（限制队列长度）
-                futures.append(executor.submit(
-                    upload_chunk, 
-                    (part_num, chunk, url, 3)
-                ))
-                
+                future = executor.submit(
+                    upload_chunk,
+                    (part_num, chunk, url, 3),
+                    connect_timeout,
+                    read_timeout,
+                )
+                futures.append(future)
+                future_parts[future] = part_num
+
                 # 控制内存占用
                 if len(futures) >= max_workers * 2:
-                    for future in as_completed(futures):
-                        part_num, etag = future.result()
-                        if etag:
-                            uploaded_parts.append({"PartNumber": part_num, "ETag": etag})
-                        else:
-                            failed_parts.add(part_num)
+                    collect_futures(futures)
                     futures = []
-                    
+                    future_parts.clear()
+
             except Exception as e:
                 logging.warning(f"[分块准备失败] 序号 {part_num} 连接失败，稍后重试。详情: {str(e)[:100]}")
                 failed_parts.add(part_num)
-        
+
         # 处理剩余任务
-        for future in as_completed(futures):
-            part_num, etag = future.result()
-            if etag:
-                uploaded_parts.append({"PartNumber": part_num, "ETag": etag})
-            else:
-                failed_parts.add(part_num)
-    
+        if futures:
+            collect_futures(futures)
+    finally:
+        # 不再使用 with，避免批次超时时在上下文退出时无限等待。
+        executor.shutdown(wait=False, cancel_futures=True)
+
     return failed_parts
 
 def upload_large_video(
@@ -194,7 +256,10 @@ def upload_large_video(
     chunk_retry_rounds: int = 3,
     file_name: str = None,
     file_size: int = None,
-    file_md5: str = None
+    file_md5: str = None,
+    connect_timeout: float = DEFAULT_CHUNK_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_CHUNK_READ_TIMEOUT,
+    batch_timeout: float = DEFAULT_BATCH_TIMEOUT,
 ) -> Dict:
     """优化后的分块上传主函数"""
     try:
@@ -244,7 +309,10 @@ def upload_large_video(
             upload_data=upload_data,
             parts_to_upload=pending_parts,
             max_workers=max_workers,
-            slice_size=slice_size
+            slice_size=slice_size,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            batch_timeout=batch_timeout,
         )
         
         # 重试逻辑
@@ -259,7 +327,10 @@ def upload_large_video(
                 upload_data=upload_data,
                 parts_to_upload=failed_parts,
                 max_workers=max_workers,
-                slice_size=slice_size
+                slice_size=slice_size,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                batch_timeout=batch_timeout,
             )
             failed_parts = new_failures
         
