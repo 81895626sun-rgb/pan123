@@ -24,7 +24,10 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     filename=log_file,
     filemode='a',
-    encoding='utf-8'  # Python 3.9+ 支持
+    encoding='utf-8',  # Python 3.9+ 支持
+    # client.py 导入的第三方库可能已提前给 root logger 添加 handler；
+    # 不强制重置时 basicConfig 会被跳过，INFO 日志不会写入 upload.log。
+    force=True,
 )
 
 # 错误日志文件（只记录 ERROR 及以上级别）
