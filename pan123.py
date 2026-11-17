@@ -6,6 +6,7 @@ import time
 import os
 import re
 import requests
+import threading
 from typing import Optional, Dict,  Set, Tuple
 from concurrent.futures import (
     ThreadPoolExecutor,
@@ -105,8 +106,10 @@ def upload_chunk(
     args: Tuple[int, bytes, str, int],
     connect_timeout: float = DEFAULT_CHUNK_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_CHUNK_READ_TIMEOUT,
+    soft_deadline: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[int, Optional[str]]:
-    """上传一个 123 分片，并在请求超时或其他异常时重试。"""
+    """上传一个 123 分片，并在请求超时或其他异常时重试。soft_deadline 仅限制提交与 HTTP 请求。"""
     part_num, chunk, current_url, max_retries = args
     chunk_size = len(chunk)
     headers = {
@@ -116,12 +119,25 @@ def upload_chunk(
     retry_limit = max(1, int(max_retries))
 
     for attempt in range(1, retry_limit + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        timeout = (connect_timeout, read_timeout)
+        if soft_deadline is not None:
+            remaining = soft_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = (
+                min(connect_timeout, remaining),
+                min(read_timeout, remaining),
+            )
+
         try:
             response = requests.put(
                 current_url,
                 data=chunk,
                 headers=headers,
-                timeout=(connect_timeout, read_timeout),
+                timeout=timeout,
             )
 
             if response.status_code not in [200, 201]:
@@ -154,13 +170,16 @@ def process_upload_batch(
     connect_timeout: float = DEFAULT_CHUNK_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_CHUNK_READ_TIMEOUT,
     batch_timeout: float = DEFAULT_BATCH_TIMEOUT,
-) -> Set[int]:
-    """严格控制内存的批量上传，并对分片批次设置超时。"""
+) -> Tuple[Set[int], list]:
+    """批量上传并返回失败分片和成功 ETag；batch_timeout 是软截止时间。"""
     failed_parts = set()
     uploaded_parts = []
+    soft_deadline = time.monotonic() + batch_timeout
+    cancel_event = threading.Event()
     executor = ThreadPoolExecutor(max_workers=max_workers)
     futures = []
     future_parts = {}
+    submitted_parts = set()
 
     def collect_futures(batch_futures):
         processed = set()
@@ -182,23 +201,31 @@ def process_upload_batch(
                 failed_parts.add(part_num)
 
         try:
-            for future in as_completed(batch_futures, timeout=batch_timeout):
+            remaining = min(batch_timeout, soft_deadline - time.monotonic())
+            if remaining <= 0:
+                raise FuturesTimeoutError()
+            for future in as_completed(batch_futures, timeout=remaining):
                 collect_one(future)
         except FuturesTimeoutError:
             logging.warning(
-                f"[分块超时] 批次在 {batch_timeout} 秒内未完成，未完成分片将重试"
+                f"[分块软截止] 批次在 {batch_timeout} 秒内未完成，未完成分片将重试；已提交任务仍会等待结束"
             )
+            # cancel() 只能取消尚未运行的任务；运行中的任务必须等其自身
+            # 请求超时并终止后再收集，避免下一轮重投同一分片。
+            cancel_event.set()
             for future in batch_futures:
-                if future in processed:
-                    continue
-                if future.done():
-                    collect_one(future)
-                else:
+                if future not in processed and not future.running():
                     future.cancel()
-                    failed_parts.add(future_parts[future])
+            for future in batch_futures:
+                if future not in processed:
+                    collect_one(future)
 
     try:
         for part_num in sorted(parts_to_upload):
+            if time.monotonic() >= soft_deadline:
+                failed_parts.update(set(parts_to_upload) - submitted_parts - failed_parts)
+                break
+
             try:
                 # 获取上传URL
                 prepare_parts = client.upload_prepare({
@@ -212,11 +239,17 @@ def process_upload_batch(
                 url = prepare_parts['data']['presignedUrls'].get(str(part_num))
                 if not url:
                     raise ValueError("URL缺失")
+                if time.monotonic() >= soft_deadline:
+                    failed_parts.add(part_num)
+                    continue
 
                 # 分块读取（严格控制内存）
                 with open(file_path, "rb") as f:
                     f.seek((part_num - 1) * slice_size)
                     chunk = f.read(slice_size)
+                if time.monotonic() >= soft_deadline:
+                    failed_parts.add(part_num)
+                    continue
 
                 # 提交任务（限制队列长度）
                 future = executor.submit(
@@ -224,9 +257,12 @@ def process_upload_batch(
                     (part_num, chunk, url, 3),
                     connect_timeout,
                     read_timeout,
+                    soft_deadline,
+                    cancel_event,
                 )
                 futures.append(future)
                 future_parts[future] = part_num
+                submitted_parts.add(part_num)
 
                 # 控制内存占用
                 if len(futures) >= max_workers * 2:
@@ -242,10 +278,12 @@ def process_upload_batch(
         if futures:
             collect_futures(futures)
     finally:
-        # 不再使用 with，避免批次超时时在上下文退出时无限等待。
-        executor.shutdown(wait=False, cancel_futures=True)
+        cancel_event.set()
+        # collect_futures 已等待运行中的任务结束；这里负责清理线程池及排队任务。
+        executor.shutdown(wait=True, cancel_futures=True)
 
-    return failed_parts
+    return failed_parts, uploaded_parts
+
 
 def upload_large_video(
     client: P123Client,
@@ -303,7 +341,7 @@ def upload_large_video(
         uploaded_part_numbers = {int(p["PartNumber"]) for p in uploaded_parts}  # 字符串转整数
         pending_parts = set(range(1, part_count + 1)) - uploaded_part_numbers
         # 分批上传
-        failed_parts = process_upload_batch(
+        failed_parts, new_uploaded_parts = process_upload_batch(
             client=client,
             file_path=file_path,
             upload_data=upload_data,
@@ -314,14 +352,15 @@ def upload_large_video(
             read_timeout=read_timeout,
             batch_timeout=batch_timeout,
         )
-        
+        uploaded_parts.extend(new_uploaded_parts)
+
         # 重试逻辑
         for retry in range(chunk_retry_rounds):
             if not failed_parts:
                 break
-                
+
             logging.info(f"\n[重试] 第 {retry+1} 轮 ({len(failed_parts)}个分块)")
-            new_failures = process_upload_batch(
+            new_failures, new_uploaded_parts = process_upload_batch(
                 client=client,
                 file_path=file_path,
                 upload_data=upload_data,
@@ -332,6 +371,7 @@ def upload_large_video(
                 read_timeout=read_timeout,
                 batch_timeout=batch_timeout,
             )
+            uploaded_parts.extend(new_uploaded_parts)
             failed_parts = new_failures
         
         if failed_parts:
